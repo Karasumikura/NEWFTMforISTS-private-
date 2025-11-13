@@ -493,17 +493,32 @@ class istsplm_forecast(nn.Module):
         
         # [MODIFIED] 设置我们的 PLM4TS_Base 作为基础
         self.config.use_cache = True 
-        # [FIX 4 - ArgError] 硬编码 n_plm_layers=2 (一个用于时间，一个用于变量)
-        # (原为 args.n_plm_layers, 但 regression.py 未定义)
-        gpts = [PLM4TS_Base(self.config) for _ in range(2)]
         
-        # [MODIFIED] 注入 CT-RoPE
-        # 这会用 CTRoPEQwen2Attention 替换 Qwen2Attention
-        gpts = [inject_CTRoPE_to_model(gpt) for gpt in gpts]
+        # [FIX 6 - AttributeError]
+        # 修复了 AttributeError: 'PLM4TS_Base' object has no attribute 'load_weights'
+        # 我们必须使用 .from_pretrained() 来加载权重，然后再注入 CT-RoPE。
+        
+        # [FIX 4 - ArgError] 硬编码 n_plm_layers=2 (一个用于时间，一个用于变量)
+        gpts = []
+        for _ in range(2):
+            # 2a. 使用 .from_pretrained() 加载预训练模型
+            # 这会使用我们的 PLM4TS_Base 类，并加载预训练权重
+            model = PLM4TS_Base.from_pretrained(
+                self.plm_name,
+                config=self.config,
+                trust_remote_code=True # 确保 Qwen 代码可以运行
+            )
+            
+            # 2b. 注入 CT-RoPE
+            # 这会用 CTRoPEQwen2Attention 替换 Qwen2Attention
+            # 并将 .from_pretrained() 加载的权重复制过去
+            model = inject_CTRoPE_to_model(model)
+            
+            gpts.append(model)
         
         # 2. 加载预训练权重 (在注入 CT-RoPE 之后)
-        for gpt in gpts:
-            gpt.load_weights(self.plm_name)
+        # for gpt in gpts:
+        #     gpt.load_weights(self.plm_name) # <-- [FIX 6] 移除此错误行
         
         # 3. (可选) 应用 LoRA
         if args.use_lora:

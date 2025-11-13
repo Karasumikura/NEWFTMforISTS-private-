@@ -297,7 +297,7 @@ class istsplm_forecast(nn.Module):
             target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
             lora_dropout=0.1,
             bias="none",
-            task_type=TaskType.CAUSAL_LM, 
+            task_type=TaskType.FEATURE_EXTRACTION, 
         )
         
         print("Aplicando LoRA al PLM Time-Aware INT4...")

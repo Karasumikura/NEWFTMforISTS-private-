@@ -22,7 +22,8 @@ from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2Model, 
     Qwen2PreTrainedModel,
     apply_rotary_pos_emb,
-    Qwen2MLP
+    Qwen2MLP,
+    Qwen2RMSNorm  # <--- (!!!) 修复点 1: 导入 Qwen2RMSNorm
 )
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from peft import get_peft_model, LoraConfig, TaskType
@@ -105,9 +106,9 @@ class CustomQwen2Attention(Qwen2Attention):
         
         # Lógica de atención (Flash o SDPA)
         if hasattr(self, '_use_flash_attention_2') and self._use_flash_attention_2:
-             attn_output = self._flash_attention_forward(query_states, key_states, value_states, attention_mask, q_len, dropout=self.attention_dropout)
+            attn_output = self._flash_attention_forward(query_states, key_states, value_states, attention_mask, q_len, dropout=self.attention_dropout)
         elif hasattr(self, '_sdpa_attention_forward'):
-             attn_output = self._sdpa_attention_forward(query_states, key_states, value_states, attention_mask, q_len, dropout=self.attention_dropout)
+            attn_output = self._sdpa_attention_forward(query_states, key_states, value_states, attention_mask, q_len, dropout=self.attention_dropout)
         else:
             # Fallback para versiones antiguas de transformers
             attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
@@ -131,8 +132,10 @@ class CustomQwen2DecoderLayer(Qwen2DecoderLayer):
         self.hidden_size = config.hidden_size
         self.self_attn = CustomQwen2Attention(config, layer_idx)
         self.mlp = Qwen2MLP(config)
-        self.input_layernorm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # <--- (!!!) 修复点 2: 将 nn.LayerNorm 替换为 Qwen2RMSNorm
+        self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+    
     def forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, output_attentions=False, use_cache=False, **kwargs):
         timestamps = kwargs.get("timestamps")
         if timestamps is None:
@@ -164,11 +167,13 @@ class CustomQwen2Model(Qwen2Model):
         self.vocab_size = config.vocab_size
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList([CustomQwen2DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
-        self.norm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # <--- (!!!) 修复点 3: 将 nn.LayerNorm 替换为 Qwen2RMSNorm
+        self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_init()
+    
     def forward(self, input_ids=None, attention_mask=None, position_ids=None, past_key_values=None, inputs_embeds=None, use_cache=None, output_attentions=None, output_hidden_states=None, return_dict=None, timestamps=None):
         if timestamps is None:
-             raise ValueError("CustomQwen2Model debe recibir el argumento 'timestamps'")
+            raise ValueError("CustomQwen2Model debe recibir el argumento 'timestamps'")
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         use_cache = use_cache if use_cache is not None else self.config.use_cache
@@ -297,6 +302,7 @@ class istsplm_forecast(nn.Module):
             target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
             lora_dropout=0.1,
             bias="none",
+            # <--- (!!!) 修复点 4: 修复 `prepare_inputs_for_generation` 错误
             task_type=TaskType.FEATURE_EXTRACTION, 
         )
         
@@ -312,7 +318,8 @@ class istsplm_forecast(nn.Module):
         self.gpts.append(variable_aware_plm)
             
         # --- 4. Cabezal de Predicción (Forecasting Head) ---
-        self.ln_proj = nn.LayerNorm(self.d_model)
+        self.ln_proj = nn.LayerNorm(self.d_model) # <--- 注意: 这个 LayerNorm 没报错，因为它处理的是 375 行的 'outputs'
+                                                 # 它是在 PLM 之外的，并且输入类型可能是 float32
         
         # La salida de Qwen será (B, D * d_model)
         qwen_output_dim = self.d_model * self.n_var 
@@ -326,12 +333,12 @@ class istsplm_forecast(nn.Module):
         # (!!!) Mantenemos 'predict_decoder' por si acaso 'evaluation.py' lo usa
         # aunque nuestro 'forecasting' principal no lo hará.
         self.predict_decoder = nn.Sequential(
-			nn.Linear(opt.d_model+1, opt.d_model),
-			nn.ReLU(inplace=True),
-			nn.Linear(opt.d_model, opt.d_model),
-			nn.ReLU(inplace=True),
-			nn.Linear(opt.d_model, 1)
-		).to(opt.device)
+            nn.Linear(opt.d_model+1, opt.d_model),
+            nn.ReLU(inplace=True),
+            nn.Linear(opt.d_model, opt.d_model),
+            nn.ReLU(inplace=True),
+            nn.Linear(opt.d_model, 1)
+        ).to(opt.device)
         
 
     def forecasting(self, time_steps_to_predict, observed_data, observed_tp, observed_mask):

@@ -322,7 +322,7 @@ def normalize_masked_data(data, mask, att_min, att_max):
 	scale = att_max - att_min
 	scale = scale + (scale == 0) * 1e-8
 	# we don't want to divide by zero
-	if (scale != 0.).all(): 
+	if (scale != 0.).all():
                 
 		# (!!!) 修正点：
 		# 原始代码: data_norm = (data - att_min) / scale

@@ -44,6 +44,8 @@ class istsplm_forecast(nn.Module):
             torch_dtype=torch.float32
         )
         self.qwen = getattr(qwen_base, "model", qwen_base)
+        if hasattr(args, "n_te_plmlayer"):
+            self.qwen.layers = self.qwen.layers[:args.n_te_plmlayer]
         if self.enable_ct_rope:
             self.qwen = self._inject_ctr_rope(self.qwen, verbose=False)
 

@@ -151,13 +151,24 @@ class istsplm_forecast(nn.Module):
             raise ValueError("Qwen backbone缺少 layers 属性。")
         layers = core_model.layers
 
-        try:
-            from transformers.models.qwen3.modeling_qwen3 import apply_rotary_pos_emb
-        except Exception:
-            try:
-                from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
-            except Exception:
-                raise RuntimeError("无法导入 apply_rotary_pos_emb，需升级 transformers。")
+        # 连续时间版 RoPE：自实现，避免依赖 Qwen 内部的 apply_rotary_pos_emb 签名
+        def _apply_rotary_pos_emb_continuous(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+            # x: (bsz, n_heads, seq_len, head_dim)
+            # cos/sin: (bsz, 1, seq_len, head_dim//2)
+            hd = x.size(-1)
+            assert hd % 2 == 0, "head_dim 必须为偶数以应用 RoPE"
+            x1 = x[..., 0::2]
+            x2 = x[..., 1::2]
+            # broadcast cos/sin to (bsz, n_heads, seq_len, head_dim//2)
+            cos_b = cos.expand(-1, x.size(1), -1, -1)
+            sin_b = sin.expand(-1, x.size(1), -1, -1)
+            x1_new = x1 * cos_b - x2 * sin_b
+            x2_new = x2 * cos_b + x1 * sin_b
+            # interleave even/odd back
+            out = torch.empty_like(x)
+            out[..., 0::2] = x1_new
+            out[..., 1::2] = x2_new
+            return out
 
         def wrap(old_attn):
             original_forward = old_attn.forward
@@ -183,7 +194,6 @@ class istsplm_forecast(nn.Module):
                 past_key_value: Optional[Tuple[torch.Tensor]] = None,
                 output_attentions: bool = False,
                 use_cache: bool = False,
-                timestamps: Optional[torch.Tensor] = None,
                 cache_position: Optional[torch.LongTensor] = None,
                 **kwargs,
             ):
@@ -199,7 +209,8 @@ class istsplm_forecast(nn.Module):
                         **kwargs,
                     )
 
-                # 强制检查 timestamps
+                # 从 backbone 属性读取 timestamps（由上层在调用前设置）
+                timestamps = getattr(core_model, "_ct_timestamps", None)
                 if timestamps is None:
                     raise ValueError("[CT-RoPE] timestamps is None (必须提供).")
                 bsz, q_len, hidden_size = hidden_states.shape
@@ -248,9 +259,27 @@ class istsplm_forecast(nn.Module):
                 t_norm = (timestamps - tmin) / span
                 t_scaled = t_norm * self.time_scale  # (bsz, q_len)
 
-                cos, sin = rotary_emb(v, seq_len=kv_seq_len)
-                ts = t_scaled.view(bsz, 1, q_len, 1).to(q.dtype)
-                q, k = apply_rotary_pos_emb(q, k, cos, sin, ts)
+                # 使用 attn 的 RotaryEmbedding 参数（inv_freq）按连续时间生成 cos/sin
+                if not hasattr(rotary_emb, "inv_freq"):
+                    raise ValueError("[CT-RoPE] 找不到 rotary_emb.inv_freq，无法生成连续 RoPE。")
+                inv_freq = rotary_emb.inv_freq.to(q.dtype)  # (head_dim//2,)
+                head_dim = q.shape[-1]
+                if head_dim % 2 != 0:
+                    raise ValueError("[CT-RoPE] head_dim 必须为 2 的倍数。")
+                half_dim = head_dim // 2
+                if inv_freq.numel() != half_dim:
+                    # 某些实现里 inv_freq 可能是 (half_dim,) 或 (1, half_dim)
+                    inv_freq = inv_freq.view(-1)
+                    if inv_freq.numel() != half_dim:
+                        raise ValueError(f"[CT-RoPE] inv_freq 长度 {inv_freq.numel()} 与 half_dim {half_dim} 不匹配")
+
+                # 角度： (bsz, q_len, half_dim)
+                angles = t_scaled.to(q.dtype).unsqueeze(-1) * inv_freq.view(1, 1, half_dim)
+                cos = torch.cos(angles).unsqueeze(1)  # (bsz, 1, q_len, half_dim)
+                sin = torch.sin(angles).unsqueeze(1)  # (bsz, 1, q_len, half_dim)
+
+                q = _apply_rotary_pos_emb_continuous(q, cos, sin)
+                k = _apply_rotary_pos_emb_continuous(k, cos, sin)
 
                 if past_key_value is not None:
                     k = torch.cat([past_key_value[0], k], dim=2)
@@ -340,12 +369,18 @@ class istsplm_forecast(nn.Module):
         if timestamps.shape[1] < 2:
             raise ValueError(f"构造出的 timestamps 长度 {timestamps.shape[1]} < 2，不符合 CT-RoPE 要求。")
 
-        out_time = self.qwen(
-            inputs_embeds=tokens_flat,
-            timestamps=timestamps if self.enable_ct_rope else None,
-            use_cache=False,
-            output_attentions=False
-        ).last_hidden_state
+        # 通过属性向注意力层传递连续时间戳（避免多层 **kwargs 传递失败）
+        if self.enable_ct_rope:
+            setattr(self.qwen, "_ct_timestamps", timestamps)
+        try:
+            out_time = self.qwen(
+                inputs_embeds=tokens_flat,
+                use_cache=False,
+                output_attentions=False
+            ).last_hidden_state
+        finally:
+            if hasattr(self.qwen, "_ct_timestamps"):
+                delattr(self.qwen, "_ct_timestamps")
 
         obs_mask_flat = observed_mask.permute(0, 2, 1).reshape(B * D, L_obs, 1)
         mask_with_prompt = torch.cat(

@@ -88,7 +88,6 @@ parser.add_argument('--lora_dropout', type=float, default=0.1, help="[ADDED] LoR
 parser.add_argument('--enable_ct_rope', action='store_true', help='Enable CT-RoPE injection (default true).')
 parser.add_argument('--ctrope_norm_mode', type=str, default='minmax', choices=['minmax','none','center'], help='Time normalization mode for CT-RoPE.')
 parser.add_argument('--prompt_zero_timestamp', action='store_true', help='Use zero timestamp for variable prompt token.')
-parser.add_argument('--no_rotate_prompt', action='store_true', help='Do not apply CT-RoPE rotation to the prompt token.')
 
 # ==================================================================================
 # (!!!) 新增参数: 变量分支 BERT 与其 LoRA

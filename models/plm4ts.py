@@ -447,7 +447,7 @@ class istsplm_forecast(nn.Module):
         
         observed_data = batch_dict["observed_data"].to(self.device) # (B, L_obs, D)
         observed_mask = batch_dict["observed_mask"].to(self.device) # (B, L_obs, D)
-        observed_tp = batch_dict["observed_tp"].to(self.device)     # (B, L_obs)
+        observed_tp_raw = batch_dict["observed_tp"].to(self.device) # (B, L_obs) 或 (B, 1, L_obs)
         tp_to_predict = batch_dict["tp_to_predict"].to(self.device) # (B, L_pred)
 
         B, L_obs, D = observed_data.shape
@@ -464,6 +464,8 @@ class istsplm_forecast(nn.Module):
         value_embed = self.value_embedding(x_flat) 
 
         # 1b. Times Embedding (CT-RoPE)
+        # 将 observed_tp 统一成二维 (B, L_obs)，兼容 (B, L_obs) 与 (B, 1, L_obs)
+        observed_tp = observed_tp_raw.reshape(B, -1)  # (B, L_obs)
         # 复制 observed_tp，使其与 (B*D) 批次大小匹配
         tt = observed_tp.unsqueeze(1).expand(B, D, L_obs).reshape(B * D, L_obs)
         
@@ -476,14 +478,12 @@ class istsplm_forecast(nn.Module):
         tt_with_prompt = torch.cat([tt_prompt, tt], dim=1) # (B*D, L_prompt + L_obs)
         
         # 1d. Attention Mask (忽略 Prompt)
-        time_attn_mask_data_flat = observed_mask[:, :, 0].flatten().unsqueeze(1) # (B*D, L_obs)
+        # 修复：使用每个变量自己的 mask，形状对齐到 (B*D, L_obs)
+        time_attn_mask_data_flat = observed_mask.permute(0, 2, 1).reshape(B * D, L_obs) # (B*D, L_obs)
         time_attn_mask_prompt = torch.ones(B * D, self.prompt_len, device=self.device) # Prompt 完全可见
-        time_attn_mask = torch.cat([time_attn_mask_prompt, time_attn_mask_data_flat], dim=1)
-        # 转换为 Qwen 所需的格式 (B, 1, 1, L_total)
-        # Qwen attention mask 处理复杂，这里我们使用 (B, 1, L_total, L_total) 的对角下三角掩码
-        # 为了简单，我们只使用 padding mask (B, 1, 1, L_total)
-        # 注意：Qwen内部会自动生成 causal mask
-        time_attn_mask = (1.0 - time_attn_mask) * torch.finfo(torch.float32).min # (B*D, L_total) -> 转换为 additive mask
+        time_attn_mask = torch.cat([time_attn_mask_prompt, time_attn_mask_data_flat], dim=1) # (B*D, L_total)
+        # 转换为 Qwen 所需的 additive mask (B*D, 1, 1, L_total); Qwen 内部有因果掩码
+        time_attn_mask = (1.0 - time_attn_mask) * torch.finfo(torch.float32).min
         time_attn_mask = time_attn_mask.unsqueeze(1).unsqueeze(1) # (B*D, 1, 1, L_total)
         time_attn_mask = time_attn_mask.to(self.device)
 

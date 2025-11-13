@@ -102,16 +102,9 @@ class istsplm_forecast(nn.Module):
         # Projection after time-PLM pooling
         self.ln_proj = nn.LayerNorm(self.d_model)
 
-        # Old constant head kept for ablation (unused by default)
-        self.forecasting_head = nn.Sequential(
-            nn.Linear(self.d_model, self.d_model // 2),
-            nn.LeakyReLU(),
-            nn.Linear(self.d_model // 2, self.num_types)
-        )
-
     # ---------------- Freeze / LoRA ----------------
     def _apply_lora_qwen(self, args, model):
-        # IMPORTANT: use FEATURE_EXTRACTION for base (non-generation) model
+        # Use FEATURE_EXTRACTION for base (non-generation) model
         target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
         lora_cfg = LoraConfig(
             r=args.lora_r,
@@ -119,7 +112,7 @@ class istsplm_forecast(nn.Module):
             target_modules=target_modules,
             lora_dropout=args.lora_dropout,
             bias="none",
-            task_type=TaskType.FEATURE_EXTRACTION  # changed from CAUSAL_LM
+            task_type=TaskType.FEATURE_EXTRACTION
         )
         model = get_peft_model(model, lora_cfg)
         for n, p in model.named_parameters():
@@ -136,7 +129,7 @@ class istsplm_forecast(nn.Module):
             target_modules=target_modules,
             lora_dropout=args.lora_dropout,
             bias="none",
-            task_type=TaskType.FEATURE_EXTRACTION  # changed from CAUSAL_LM
+            task_type=TaskType.FEATURE_EXTRACTION
         )
         model = get_peft_model(model, lora_cfg)
         for n, p in model.named_parameters():
@@ -376,9 +369,15 @@ class istsplm_forecast(nn.Module):
         out_var = self.proj_from_bert(bert_out)  # (B, D, H)
 
         # 3) Time-aware forecasting per variable
-        # Normalize future times from observed min/max (per-batch)
-        tmin_obs = observed_tp.min(dim=1, keepdim=True).values  # (B,1)
-        tmax_obs = observed_tp.max(dim=1, keepdim=True).values  # (B,1)
+        # Normalize future times; if observed_tp is empty (L_time==0), fall back to tp_to_predict range.
+        if observed_tp.shape[1] > 0:
+            tmin_obs = observed_tp.min(dim=1, keepdim=True).values  # (B,1)
+            tmax_obs = observed_tp.max(dim=1, keepdim=True).values  # (B,1)
+        else:
+            # Fallback: use prediction times when no observed timestamps are available
+            tmin_obs = tp_to_predict.min(dim=1, keepdim=True).values
+            tmax_obs = tp_to_predict.max(dim=1, keepdim=True).values
+
         tptp_obs = torch.clamp(tmax_obs - tmin_obs, min=1e-8)
         tpred_norm = torch.clamp((tp_to_predict - tmin_obs) / tptp_obs, 0.0, 1.0)  # (B, L_pred)
 

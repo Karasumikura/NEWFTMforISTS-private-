@@ -153,8 +153,22 @@ class CustomQwen2Attention(Qwen2Attention):
             attn_output = self._sdpa_attention_forward(query_states, key_states, value_states, attention_mask, q_len, dropout=self.attention_dropout)
         else:
             attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+
+            # ================== (!!!) 修复后的代码块 (!!!) ==================
             if attention_mask is not None:
+                # 1. 检查掩码是否是 2D (bsz, seq_len)
+                if attention_mask.dim() == 2:
+                    # 2. 将 2D 掩码 (bsz, kv_len) 扩展为 4D (bsz, 1, 1, kv_len)
+                    #    以便广播到 (bsz, num_heads, q_len, kv_len)
+                    attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                    
+                    # 3. 将 1s (保留) / 0s (屏蔽) 转换为 0.0 (保留) / -inf (屏蔽)
+                    attention_mask = (1.0 - attention_mask.to(attn_weights.dtype)) * torch.finfo(attn_weights.dtype).min
+                
+                # 4. 现在可以安全相加了
                 attn_weights = attn_weights + attention_mask
+            # ================== (!!!) 修复结束 (!!!) ==================
+                
             attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
             attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
             attn_output = torch.matmul(attn_weights, value_states)

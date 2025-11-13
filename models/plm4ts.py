@@ -36,6 +36,8 @@ class istsplm_forecast(nn.Module):
         self.prompt_zero_timestamp = getattr(args, "prompt_zero_timestamp", True)
         # 可学习线性时间缩放 (代替简单 time_scale)
         self.time_linear_scale = nn.Parameter(torch.tensor([1.0, 0.0], dtype=torch.float32))  # [a,b] 用于 a*t + b
+        # 是否保持 prompt token 不旋转
+        self.no_rotate_prompt = getattr(args, "no_rotate_prompt", False)
 
         self.qwen_path = args.plm_path
         self.bert_path = getattr(args, "bert_path", "bert-base-uncased")
@@ -316,6 +318,9 @@ class istsplm_forecast(nn.Module):
                 # 线性缩放 + 幅度缩放
                 a, b = self.time_linear_scale[0], self.time_linear_scale[1]
                 t_scaled = (a * t_base + b) * self.time_scale  # (bsz, q_len)
+                if self.no_rotate_prompt and q_len > 0:
+                    # 将第一个 token (变量 prompt) 的旋转角度强制设为 0
+                    t_scaled[:, 0] = 0.0
 
                 # 使用 attn 的 RotaryEmbedding 参数（inv_freq）按连续时间生成 cos/sin
                 if not hasattr(rotary_emb, "inv_freq"):

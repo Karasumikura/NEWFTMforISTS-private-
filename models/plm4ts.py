@@ -20,7 +20,8 @@ class istsplm_forecast(nn.Module):
         super().__init__()
         self.args = args
         self.device = args.device
-        self.d_model = args.d_model
+            # 基础 d_model（可能在 auto_match_var_plm_dim 下被调整）
+            self.d_model = args.d_model
         self.num_types = args.num_types
 
         self.use_lora = getattr(args, "use_lora", False)
@@ -28,16 +29,34 @@ class istsplm_forecast(nn.Module):
         self.semi_freeze = getattr(args, "semi_freeze", False)
         self.enable_ct_rope = getattr(args, "enable_ct_rope", True)
         self.debug_flag = getattr(args, "debug_flag", False)
+        # 新增: 时间归一化/扩展控制参数
+        # ctrope_norm_mode: minmax | none | center
+        self.ctrope_norm_mode = getattr(args, "ctrope_norm_mode", "minmax")
+        # 是否使用 0 作为 prompt 时间戳 (与 OLD 原版变量 prompt 不含时间一致)
+        self.prompt_zero_timestamp = getattr(args, "prompt_zero_timestamp", True)
+        # 可学习线性时间缩放 (代替简单 time_scale)
+        self.time_linear_scale = nn.Parameter(torch.tensor([1.0, 0.0], dtype=torch.float32))  # [a,b] 用于 a*t + b
+        # 是否保持 prompt token 不旋转
+        self.no_rotate_prompt = getattr(args, "no_rotate_prompt", False)
 
         self.qwen_path = args.plm_path
         self.bert_path = getattr(args, "bert_path", "bert-base-uncased")
+        self.st_plm_type = getattr(args, "st_plm_type", "bert")  # 'bert' | 'qwen'
 
         self.value_emb = ValueEmbedding(2, self.d_model)
         self.var_emb = nn.Embedding(self.num_types, self.d_model)
+        # 保留旧的 time_scale 作为额外幅度因子
         self.time_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
 
         self.qwen_config = AutoConfig.from_pretrained(self.qwen_path, trust_remote_code=True)
         self.qwen_config.use_cache = False
+            # 若开启自动对齐并使用 qwen 作为第二阶段，强制 d_model 与 Qwen hidden 对齐
+            if getattr(args, 'auto_match_var_plm_dim', False) and getattr(args, 'st_plm_type', 'bert') == 'qwen':
+                if self.d_model != self.qwen_config.hidden_size:
+                    self.d_model = self.qwen_config.hidden_size
+
+            # 重新根据可能更新后的 d_model 初始化依赖 d_model 的嵌入
+            # 注意：此调整需在加载 qwen backbone 之前
         qwen_base = AutoModelForCausalLM.from_pretrained(
             self.qwen_path,
             trust_remote_code=True,
@@ -47,18 +66,39 @@ class istsplm_forecast(nn.Module):
         if self.enable_ct_rope:
             self.qwen = self._inject_ctr_rope(self.qwen, verbose=False)
 
-        self.bert = AutoModel.from_pretrained(self.bert_path, torch_dtype=torch.float32)
-        self._disable_bert_position_embeddings(self.bert)
-        self.bert_hidden = self.bert.config.hidden_size
-        if hasattr(args, "n_st_plmlayer"):
-            self.bert.encoder.layer = self.bert.encoder.layer[:args.n_st_plmlayer]
-
-        if self.bert_hidden != self.d_model:
-            self.proj_to_bert = nn.Linear(self.d_model, self.bert_hidden)
-            self.proj_from_bert = nn.Linear(self.bert_hidden, self.d_model)
+        # ---------------- Second Stage PLM (variable correlation) ----------------
+        if self.st_plm_type == 'bert':
+            self.bert = AutoModel.from_pretrained(self.bert_path, torch_dtype=torch.float32)
+            self._disable_bert_position_embeddings(self.bert)
+            self.bert_hidden = self.bert.config.hidden_size
+            if hasattr(args, "n_st_plmlayer"):
+                self.bert.encoder.layer = self.bert.encoder.layer[:args.n_st_plmlayer]
+            if self.bert_hidden != self.d_model:
+                self.proj_to_varplm = nn.Linear(self.d_model, self.bert_hidden)
+                self.proj_from_varplm = nn.Linear(self.bert_hidden, self.d_model)
+            else:
+                self.proj_to_varplm = nn.Identity()
+                self.proj_from_varplm = nn.Identity()
+            self.variable_plm = self.bert
+        elif self.st_plm_type == 'qwen':
+            # 创建一个仅用于变量自注意力的 Qwen 子模型 (不注入 CT-RoPE, 需要双向)
+            var_config = AutoConfig.from_pretrained(self.qwen_path, trust_remote_code=True)
+            var_config.use_cache = False
+            qwen_var_base = AutoModelForCausalLM.from_pretrained(
+                self.qwen_path,
+                trust_remote_code=True,
+                torch_dtype=torch.float32
+            )
+            var_core = getattr(qwen_var_base, 'model', qwen_var_base)
+            # 截断层数
+            if hasattr(args, 'n_st_plmlayer'):
+                var_core.layers = var_core.layers[:args.n_st_plmlayer]
+            # 注入双向注意力（去掉因果掩码）
+            self.variable_plm = self._inject_bidirectional_qwen(var_core)
+            self.proj_to_varplm = nn.Identity()  # hidden size 与 d_model 应一致
+            self.proj_from_varplm = nn.Identity()
         else:
-            self.proj_to_bert = nn.Identity()
-            self.proj_from_bert = nn.Identity()
+            raise ValueError(f"Unsupported st_plm_type: {self.st_plm_type}")
 
         self._apply_freeze_policies()
 
@@ -137,14 +177,25 @@ class istsplm_forecast(nn.Module):
         else:
             self._freeze_or_semi(self.qwen, semi=self.semi_freeze)
 
-        if self.use_lora_bert:
-            self.bert = self._apply_lora_bert(self.args, self.bert)
-            if self.semi_freeze:
-                for n, p in self.bert.named_parameters():
-                    if ("layernorm" in n.lower() or "norm" in n.lower()) and "lora" not in n:
-                        p.requires_grad = True
-        else:
-            self._freeze_or_semi(self.bert, semi=self.semi_freeze)
+        if self.st_plm_type == 'bert':
+            if self.use_lora_bert:
+                self.variable_plm = self._apply_lora_bert(self.args, self.variable_plm)
+                if self.semi_freeze:
+                    for n, p in self.variable_plm.named_parameters():
+                        if ("layernorm" in n.lower() or "norm" in n.lower()) and "lora" not in n:
+                            p.requires_grad = True
+            else:
+                self._freeze_or_semi(self.variable_plm, semi=self.semi_freeze)
+        else:  # qwen variable stage follow same freeze policy as time qwen
+            if not self.use_lora:
+                self._freeze_or_semi(self.variable_plm, semi=self.semi_freeze)
+            else:
+                # Optionally allow LoRA on variable Qwen (same target modules)
+                self.variable_plm = self._apply_lora_qwen(self.args, self.variable_plm)
+                if self.semi_freeze:
+                    for n, p in self.variable_plm.named_parameters():
+                        if ("layernorm" in n.lower() or "norm" in n.lower()) and "lora" not in n:
+                            p.requires_grad = True
 
     def _inject_ctr_rope(self, core_model, verbose: bool = True):
         if not hasattr(core_model, "layers"):
@@ -252,12 +303,26 @@ class istsplm_forecast(nn.Module):
                 if past_key_value is not None:
                     kv_seq_len += past_key_value[0].shape[-2]
 
-                # 连续时间归一化
-                tmin = timestamps.min(dim=-1, keepdim=True).values
-                tmax = timestamps.max(dim=-1, keepdim=True).values
-                span = torch.clamp(tmax - tmin, min=1e-8)
-                t_norm = (timestamps - tmin) / span
-                t_scaled = t_norm * self.time_scale  # (bsz, q_len)
+                # 连续时间处理
+                if self.ctrope_norm_mode == "minmax":
+                    tmin = timestamps.min(dim=-1, keepdim=True).values
+                    tmax = timestamps.max(dim=-1, keepdim=True).values
+                    span = torch.clamp(tmax - tmin, min=1e-8)
+                    t_base = (timestamps - tmin) / span
+                elif self.ctrope_norm_mode == "none":
+                    t_base = timestamps
+                elif self.ctrope_norm_mode == "center":
+                    t_mean = timestamps.mean(dim=-1, keepdim=True)
+                    t_std = timestamps.std(dim=-1, keepdim=True) + 1e-8
+                    t_base = (timestamps - t_mean) / t_std
+                else:
+                    raise ValueError(f"未知的 ctrope_norm_mode: {self.ctrope_norm_mode}")
+                # 线性缩放 + 幅度缩放
+                a, b = self.time_linear_scale[0], self.time_linear_scale[1]
+                t_scaled = (a * t_base + b) * self.time_scale  # (bsz, q_len)
+                if self.no_rotate_prompt and q_len > 0:
+                    # 将第一个 token (变量 prompt) 的旋转角度强制设为 0
+                    t_scaled[:, 0] = 0.0
 
                 # 使用 attn 的 RotaryEmbedding 参数（inv_freq）按连续时间生成 cos/sin
                 if not hasattr(rotary_emb, "inv_freq"):
@@ -324,6 +389,95 @@ class istsplm_forecast(nn.Module):
                     print(f"[CT-RoPE] patched layer {i}")
         return core_model
 
+    def _inject_bidirectional_qwen(self, core_model):
+        """移除 Qwen 因果掩码，构造双向自注意力 forward，供变量相关性建模使用。"""
+        if not hasattr(core_model, 'layers'):
+            raise ValueError('variable Qwen core missing layers')
+        layers = core_model.layers
+
+        def make_forward(old_attn):
+            q_proj = getattr(old_attn, 'q_proj', None)
+            k_proj = getattr(old_attn, 'k_proj', None)
+            v_proj = getattr(old_attn, 'v_proj', None)
+            o_proj = getattr(old_attn, 'o_proj', None)
+            attn_dropout = getattr(old_attn, 'attn_dropout', nn.Dropout(0.0))
+
+            def repeat_kv(kv: torch.Tensor, n_rep: int) -> torch.Tensor:
+                if n_rep == 1:
+                    return kv
+                bsz, kv_heads, seqlen, hd = kv.shape
+                return kv.unsqueeze(2).expand(bsz, kv_heads, n_rep, seqlen, hd).reshape(
+                    bsz, kv_heads * n_rep, seqlen, hd
+                )
+
+            def bi_forward(
+                hidden_states: torch.Tensor,
+                attention_mask: Optional[torch.Tensor] = None,
+                position_ids: Optional[torch.LongTensor] = None,
+                past_key_value: Optional[Tuple[torch.Tensor]] = None,
+                output_attentions: bool = False,
+                use_cache: bool = False,
+                cache_position: Optional[torch.LongTensor] = None,
+                **kwargs,
+            ):
+                bsz, q_len, hidden_size = hidden_states.shape
+                hidden_states = hidden_states.float()
+                q = q_proj(hidden_states)
+                k = k_proj(hidden_states)
+                v = v_proj(hidden_states)
+
+                head_dim_attr = getattr(old_attn, 'head_dim', None)
+                if head_dim_attr is not None:
+                    head_dim = head_dim_attr
+                    num_query_heads = q.shape[-1] // head_dim
+                else:
+                    tentative_heads = getattr(old_attn, 'num_heads', None)
+                    if tentative_heads is None:
+                        head_dim = 64
+                        num_query_heads = q.shape[-1] // head_dim
+                    else:
+                        head_dim = q.shape[-1] // tentative_heads
+                        num_query_heads = tentative_heads
+                num_kv_heads = getattr(old_attn, 'num_key_value_heads', None)
+                if num_kv_heads is None:
+                    num_kv_heads = num_query_heads
+                if q.shape[-1] != num_query_heads * head_dim:
+                    raise ValueError('q dim mismatch during bidirectional qwen attention')
+
+                q = q.view(bsz, q_len, num_query_heads, head_dim).transpose(1, 2)
+                k = k.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+                v = v.view(bsz, q_len, num_kv_heads, head_dim).transpose(1, 2)
+
+                if past_key_value is not None:
+                    k = torch.cat([past_key_value[0], k], dim=2)
+                    v = torch.cat([past_key_value[1], v], dim=2)
+                if num_kv_heads != num_query_heads:
+                    assert num_query_heads % num_kv_heads == 0
+                    k = repeat_kv(k, num_query_heads // num_kv_heads)
+                    v = repeat_kv(v, num_query_heads // num_kv_heads)
+
+                past = (k, v) if use_cache else None
+                # 双向：不添加下三角因果掩码
+                attn_scores = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(head_dim)
+                if attention_mask is not None:
+                    attn_scores = attn_scores + attention_mask.to(attn_scores.dtype)
+                attn_weights = nn.functional.softmax(attn_scores, dim=-1)
+                attn_weights = attn_dropout(attn_weights)
+                attn_output = torch.matmul(attn_weights, v)
+                attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, num_query_heads * head_dim)
+                attn_output = o_proj(attn_output)
+                attn_ret = attn_weights if output_attentions else None
+                if use_cache:
+                    return attn_output, attn_ret, past
+                return attn_output, attn_ret
+
+            return bi_forward
+
+        for lyr in layers:
+            if hasattr(lyr, 'self_attn'):
+                lyr.self_attn.forward = make_forward(lyr.self_attn)
+        return core_model
+
     def forecasting(self, batch_dict, n_vars_to_predict=None):
         observed_data = batch_dict["observed_data"].to(self.device).float()
         observed_mask = batch_dict["observed_mask"].to(self.device).float()
@@ -362,8 +516,13 @@ class istsplm_forecast(nn.Module):
         tokens_flat = tokens.permute(0, 2, 1, 3).reshape(B * D, seq_len, self.d_model)
 
         tp_for_each_var = tt_bd.permute(0, 2, 1)  # (B,D,L_obs)
-        t_min = tp_for_each_var.min(dim=-1, keepdim=True).values
-        tp_with_prompt = torch.cat([t_min, tp_for_each_var], dim=-1)  # (B,D,L_obs+1)
+        if self.prompt_zero_timestamp:
+            zero_ts = torch.zeros_like(tp_for_each_var[:, :, :1])
+            tp_with_prompt = torch.cat([zero_ts, tp_for_each_var], dim=-1)
+        else:
+            # 保持与之前实现兼容: 使用各变量最小时间作为 prompt 时间戳
+            t_min = tp_for_each_var.min(dim=-1, keepdim=True).values
+            tp_with_prompt = torch.cat([t_min, tp_for_each_var], dim=-1)  # (B,D,L_obs+1)
         timestamps = tp_with_prompt.reshape(B * D, -1)
         # 强制要求 timestamps 长度至少 2（prompt + 至少一个观测）
         if timestamps.shape[1] < 2:
@@ -391,15 +550,44 @@ class istsplm_forecast(nn.Module):
         pooled = self.ln_proj(pooled).view(B, D, -1)
 
         var_in = pooled + self.var_emb.weight.unsqueeze(0).expand(B, D, -1)
-        var_in_bert = self.proj_to_bert(var_in)
-        bert_out = self.bert(inputs_embeds=var_in_bert).last_hidden_state
-        out_var = self.proj_from_bert(bert_out)
+        if self.st_plm_type == 'bert':
+            var_in_emb = self.proj_to_varplm(var_in)
+            var_out = self.variable_plm(inputs_embeds=var_in_emb).last_hidden_state
+            out_var = self.proj_from_varplm(var_out)
+        else:  # qwen variable stage
+            out_var = self.variable_plm(inputs_embeds=var_in).last_hidden_state
 
         L_pred = tp_to_predict.shape[1]
-        t_future = tp_to_predict.unsqueeze(-1)
-        var_rep = out_var.unsqueeze(1).expand(-1, L_pred, -1, -1)
-        time_rep = t_future.unsqueeze(2).expand(-1, -1, D, -1)
-        fused = torch.cat([var_rep, time_rep], dim=-1)
+        # -----------------------------------------------
+        # 预测阶段时间归一化与训练阶段一致
+        # -----------------------------------------------
+        # tp_for_each_var: (B,D,L_obs) 之前构造过，用于统计
+        # tp_to_predict: (B,L_pred)
+        t_future_raw = tp_to_predict  # (B,L_pred)
+        # 展开至 (B,L_pred,D)
+        t_future = t_future_raw.unsqueeze(-1).expand(-1, L_pred, D)
+        if self.ctrope_norm_mode == 'minmax':
+            tmin_hist = tp_for_each_var.min(dim=-1).values  # (B,D)
+            tmax_hist = tp_for_each_var.max(dim=-1).values  # (B,D)
+            span_hist = torch.clamp(tmax_hist - tmin_hist, min=1e-8)  # (B,D)
+            tmin_hist = tmin_hist.unsqueeze(1)  # (B,1,D)
+            span_hist = span_hist.unsqueeze(1)  # (B,1,D)
+            t_future_norm = (t_future - tmin_hist) / span_hist
+        elif self.ctrope_norm_mode == 'center':
+            t_mean_hist = tp_for_each_var.mean(dim=-1).values  # (B,D)
+            t_std_hist = tp_for_each_var.std(dim=-1).values + 1e-8  # (B,D)
+            t_mean_hist = t_mean_hist.unsqueeze(1)
+            t_std_hist = t_std_hist.unsqueeze(1)
+            t_future_norm = (t_future - t_mean_hist) / t_std_hist
+        else:  # 'none'
+            t_future_norm = t_future
+        # 线性缩放 + 幅度同前
+        a, b = self.time_linear_scale[0], self.time_linear_scale[1]
+        t_future_scaled = (a * t_future_norm + b) * self.time_scale  # (B,L_pred,D)
+        # 若不旋转 prompt，只影响历史的第一 token；未来时间不含 prompt 可直接使用 scaled 值
+        var_rep = out_var.unsqueeze(1).expand(-1, L_pred, -1, -1)  # (B,L_pred,D,H)
+        time_rep = t_future_scaled.unsqueeze(-1)  # (B,L_pred,D,1)
+        fused = torch.cat([var_rep, time_rep], dim=-1)  # (B,L_pred,D,H+1)
         pred = self.var_time_mlp(fused).squeeze(-1)
 
         if n_vars_to_predict is not None:

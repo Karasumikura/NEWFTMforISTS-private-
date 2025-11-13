@@ -68,6 +68,8 @@ parser.add_argument('--n_te_plmlayer', type=int, default=6)
 parser.add_argument('--n_st_plmlayer', type=int, default=6)
 parser.add_argument('--te_model', type=str, default='gpt') # (旧参数，但 Qwen 架构会覆盖它)
 parser.add_argument('--st_model', type=str, default='bert') # (旧参数，变量分支默认用 BERT（双向）)
+parser.add_argument('--st_plm_type', type=str, default='bert', choices=['bert','qwen'], help='Second-stage PLM type for variable correlation modeling.')
+parser.add_argument('--auto_match_var_plm_dim', action='store_true', help='If using Qwen second stage, automatically set d_model to Qwen hidden size to remove projections.')
 parser.add_argument('--max_len', type=int, default=-1)
 parser.add_argument('--semi_freeze', action='store_true')
 parser.add_argument('--sample_rate', type=float, default=1.0)
@@ -82,6 +84,10 @@ parser.add_argument('--use_lora', action='store_true', help="[ADDED] Enable LoRA
 parser.add_argument('--lora_r', type=int, default=8, help="LoRA rank")
 parser.add_argument('--lora_alpha', type=int, default=16, help="LoRA alpha")
 parser.add_argument('--lora_dropout', type=float, default=0.1, help="[ADDED] LoRA dropout") 
+parser.add_argument('--enable_ct_rope', action='store_true', help='Enable CT-RoPE injection (default true).')
+parser.add_argument('--ctrope_norm_mode', type=str, default='minmax', choices=['minmax','none','center'], help='Time normalization mode for CT-RoPE.')
+parser.add_argument('--prompt_zero_timestamp', action='store_true', help='Use zero timestamp for variable prompt token.')
+parser.add_argument('--no_rotate_prompt', action='store_true', help='Do not apply CT-RoPE rotation to the prompt token.')
 
 # ==================================================================================
 # (!!!) 新增参数: 变量分支 BERT 与其 LoRA

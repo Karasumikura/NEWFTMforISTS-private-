@@ -504,6 +504,35 @@ class istsplm_forecast(nn.Module):
         var_ids = torch.arange(D, device=self.device)
         var_prompt = self.var_emb(var_ids).unsqueeze(0).unsqueeze(1).expand(B, 1, D, -1)
 
+        # ---------------- Value normalization (optional) ----------------
+        norm_mode = getattr(self.args, 'value_norm', 'none')
+        # compute variable-wise stats over observed points only
+        if norm_mode != 'none':
+            # mask shape (B,L_obs,D); create mask for reduction
+            mask_obs = observed_mask  # (B,L,D)
+            # Avoid division by zero
+            count = mask_obs.sum(dim=1)  # (B,D)
+            safe_count = torch.clamp(count, min=1.0)
+            if norm_mode == 'batch_zscore':
+                sum_vals = (observed_data * mask_obs).sum(dim=1)
+                mean = sum_vals / safe_count
+                var = ((observed_data - mean.unsqueeze(1))**2 * mask_obs).sum(dim=1) / safe_count
+                std = torch.sqrt(var + 1e-6)
+                # center & scale only observed positions, keep unobserved zeros
+                observed_data = (observed_data - mean.unsqueeze(1)) / std.unsqueeze(1)
+                norm_ctx = {"mode":"zscore","mean":mean, "std":std}
+            elif norm_mode == 'batch_minmax':
+                observed_min = torch.where(mask_obs>0, observed_data, torch.full_like(observed_data, float('inf'))).min(dim=1).values
+                observed_max = torch.where(mask_obs>0, observed_data, torch.full_like(observed_data, float('-inf'))).max(dim=1).values
+                # handle all-missing by fallback to zeros
+                observed_min = torch.where(count>0, observed_min, torch.zeros_like(observed_min))
+                observed_max = torch.where(count>0, observed_max, torch.ones_like(observed_max))
+                span = (observed_max - observed_min).clamp(min=1e-6)
+                observed_data = (observed_data - observed_min.unsqueeze(1)) / span.unsqueeze(1)
+                norm_ctx = {"mode":"minmax","min":observed_min, "span":span}
+        else:
+            norm_ctx = None
+
         x = observed_data.unsqueeze(-1)
         m = observed_mask.unsqueeze(-1)
         val_in = torch.cat([x, m], dim=-1)
@@ -587,6 +616,13 @@ class istsplm_forecast(nn.Module):
         time_rep = t_future_scaled.unsqueeze(-1)  # (B,L_pred,D,1)
         fused = torch.cat([var_rep, time_rep], dim=-1)  # (B,L_pred,D,H+1)
         pred = self.var_time_mlp(fused).squeeze(-1)
+
+        # ---------------- Undo normalization for prediction ----------------
+        if norm_ctx is not None:
+            if norm_ctx["mode"] == "zscore":
+                pred = pred * norm_ctx["std"].unsqueeze(1) + norm_ctx["mean"].unsqueeze(1)
+            elif norm_ctx["mode"] == "minmax":
+                pred = pred * norm_ctx["span"].unsqueeze(1) + norm_ctx["min"].unsqueeze(1)
 
         if n_vars_to_predict is not None:
             pred = pred[:, :, :n_vars_to_predict]

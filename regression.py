@@ -70,6 +70,7 @@ parser.add_argument('--te_model', type=str, default='gpt') # (旧参数，但 Qw
 parser.add_argument('--st_model', type=str, default='bert') # (旧参数，变量分支默认用 BERT（双向）)
 parser.add_argument('--st_plm_type', type=str, default='bert', choices=['bert','qwen'], help='Second-stage PLM type for variable correlation modeling.')
 parser.add_argument('--auto_match_var_plm_dim', action='store_true', help='If using Qwen second stage, automatically set d_model to Qwen hidden size to remove projections.')
+parser.add_argument('--value_norm', type=str, default='none', choices=['none','batch_zscore','batch_minmax'], help='Value normalization strategy applied per sample & variable before embedding.')
 parser.add_argument('--max_len', type=int, default=-1)
 parser.add_argument('--semi_freeze', action='store_true')
 parser.add_argument('--sample_rate', type=float, default=1.0)

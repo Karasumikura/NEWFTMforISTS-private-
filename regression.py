@@ -67,7 +67,7 @@ parser.add_argument('--quantization', type=float, default=0.0, help="Quantizatio
 parser.add_argument('--n_te_plmlayer', type=int, default=6)
 parser.add_argument('--n_st_plmlayer', type=int, default=6)
 parser.add_argument('--te_model', type=str, default='gpt') # (旧参数，但 Qwen 架构会覆盖它)
-parser.add_argument('--st_model', type=str, default='bert') # (旧参数，但 Qwen 架构会覆盖它)
+parser.add_argument('--st_model', type=str, default='bert') # (旧参数，变量分支默认用 BERT（双向）)
 parser.add_argument('--max_len', type=int, default=-1)
 parser.add_argument('--semi_freeze', action='store_true')
 parser.add_argument('--sample_rate', type=float, default=1.0)
@@ -77,11 +77,17 @@ parser.add_argument('--collate', type=str, default='indseq')
 # ==================================================================================
 # (!!!) 新增/修改的参数: 用于 Qwen + LoRA
 # ==================================================================================
-parser.add_argument('--plm_path', type=str, default='Qwen/Qwen2-1.5B-Instruct', help="Path to Qwen2 model")
-parser.add_argument('--use_lora', action='store_true', help="[ADDED] Enable LoRA") 
+parser.add_argument('--plm_path', type=str, default='Qwen/Qwen2-1.5B-Instruct', help="Path to Qwen2/Qwen2.5 model")
+parser.add_argument('--use_lora', action='store_true', help="[ADDED] Enable LoRA for Qwen") 
 parser.add_argument('--lora_r', type=int, default=8, help="LoRA rank")
 parser.add_argument('--lora_alpha', type=int, default=16, help="LoRA alpha")
 parser.add_argument('--lora_dropout', type=float, default=0.1, help="[ADDED] LoRA dropout") 
+
+# ==================================================================================
+# (!!!) 新增参数: 变量分支 BERT 与其 LoRA
+# ==================================================================================
+parser.add_argument('--bert_path', type=str, default='bert-base-uncased', help="[ADDED] Path to BERT for variable branch")
+parser.add_argument('--use_lora_bert', action='store_true', help="[ADDED] Enable LoRA for BERT variable branch")
 
 # ==================================================================================
 # (!!!) 新增参数: 用于 ISTS-PLM (plm4ts.py 需要)
@@ -103,111 +109,115 @@ print("PID, device:", args.PID, args.device)
 
 if __name__ == '__main__':
 
-	utils.setup_seed(args.seed)
+    utils.setup_seed(args.seed)
 
-	experimentID = args.load
-	if experimentID is None:
-		# Make a new experiment ID
-		experimentID = int(SystemRandom().random()*100000)
-	
-	input_command = sys.argv
-	ind = [i for i in range(len(input_command)) if input_command[i] == "--load"]
-	if len(ind) == 1:
-		ind = ind[0]
-		input_command = input_command[:ind] + input_command[(ind+2):]
-	input_command = " ".join(input_command)
-	
+    experimentID = args.load
+    if experimentID is None:
+        # Make a new experiment ID
+        experimentID = int(SystemRandom().random()*100000)
+    
+    input_command = sys.argv
+    ind = [i for i in range(len(input_command)) if input_command[i] == "--load"]
+    if len(ind) == 1:
+        ind = ind[0]
+        input_command = input_command[:ind] + input_command[(ind+2):]
+    input_command = " ".join(input_command)
+    
     # ==================================================================================
     # (!!!) 修改: 更新日志路径以包含 LoRA 参数
     # ==================================================================================
-	if(args.n < 12000 or args.debug_flag):
-		args.state = "debug"
-		log_path = f"logs/{args.task}_{args.dataset}_{args.model}_{args.state}.log"
-	else:
-		plm_name = args.plm_path.split('/')[-1]
-		log_path = f"logs/{args.task}_{args.dataset}_{args.model}_{args.state}_plm-{plm_name}_d{args.d_model}_lora-r{args.lora_r}_lr{args.lr}.log"
+    if(args.n < 12000 or args.debug_flag):
+        args.state = "debug"
+        log_path = f"logs/{args.task}_{args.dataset}_{args.model}_{args.state}.log"
+    else:
+        plm_name = args.plm_path.split('/')[-1]
+        bert_name = args.bert_path.split('/')[-1]
+        log_path = (
+            f"logs/{args.task}_{args.dataset}_{args.model}_{args.state}"
+            f"_plm-{plm_name}_bert-{bert_name}_d{args.d_model}"
+            f"_loraQwen-{int(args.use_lora)}_loraBert-{int(args.use_lora_bert)}_lr{args.lr}.log"
+        )
     # ==================================================================================
-	
-	if not os.path.exists("logs/"):
-		utils.makedirs("logs/")
+    
+    if not os.path.exists("logs/"):
+        utils.makedirs("logs/")
 
-	logger = utils.get_logger(logpath=log_path, filepath=os.path.abspath(__file__), mode=args.logmode)
-	logger.info(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-	logger.info(input_command)
-	logger.info(args)
+    logger = utils.get_logger(logpath=log_path, filepath=os.path.abspath(__file__), mode=args.logmode)
+    logger.info(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    logger.info(input_command)
+    logger.info(args)
 
-	##################################################################
-	data_obj = parse_datasets(args, length_stat=True)
+    ##################################################################
+    data_obj = parse_datasets(args, length_stat=True)
  
     # (!!!) 关键: 将数据加载器中的 'input_dim' (变量数 D) 赋值给 args.num_types
-	args.enc_in = data_obj["input_dim"]
-	args.num_types =  data_obj["input_dim"]
-	args.input_dim =  data_obj["input_dim"] # (旧模型可能会使用这个，保留它)
+    args.enc_in = data_obj["input_dim"]
+    args.num_types =  data_obj["input_dim"]
+    args.input_dim =  data_obj["input_dim"] # (旧模型可能会使用这个，保留它)
  
-	args.median_len = data_obj["median_len"]
-	args.input_len = data_obj["max_input_len"]
-	args.pred_len = data_obj["max_pred_len"]
-	
-	### Model Config ###
-	if(args.model == 'istsplm_forecast'):
+    args.median_len = data_obj["median_len"]
+    args.input_len = data_obj["max_input_len"]
+    args.pred_len = data_obj["max_pred_len"]
+    
+    ### Model Config ###
+    if(args.model == 'istsplm_forecast'):
         # (!!!) 确保 'istsplm_forecast' 已在 plm4ts.py 中被定义
-		model = istsplm_forecast(args).to(args.device)
-	elif(args.model == 'istsplm_vector_forecast'):
-		model = istsplm_vector_forecast(args).to(args.device)
-	elif(args.model == 'istsplm_set_forecast'):
-		model = istsplm_set_forecast(args).to(args.device)
-	else:
-		raise ValueError(f"Model {args.model} not recognized.")
-	
-	### Optimizer ###
-    # (!!!) 修改: 仅优化可训练参数 (LoRA)
-	optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr, weight_decay=args.weight_decay)
+        model = istsplm_forecast(args).to(args.device)
+    elif(args.model == 'istsplm_vector_forecast'):
+        model = istsplm_vector_forecast(args).to(args.device)
+    elif(args.model == 'istsplm_set_forecast'):
+        model = istsplm_set_forecast(args).to(args.device)
+    else:
+        raise ValueError(f"Model {args.model} not recognized.")
+    
+    ### Optimizer ###
+    # (!!!) 修改: 仅优化可训练参数 (LoRA 或半冻结下的LN/头)
+    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr, weight_decay=args.weight_decay)
 
-	num_batches = data_obj["n_train_batches"] # n_sample / batch_size
-	print("n_train_batches:", num_batches)
-	print(f"Total trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
+    num_batches = data_obj["n_train_batches"] # n_sample / batch_size
+    print("n_train_batches:", num_batches)
+    print(f"Total trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
 
-	best_val_mse = np.inf
-	test_res = None
-	for itr in range(args.epoch):
-		st = time.time()
+    best_val_mse = np.inf
+    test_res = None
+    for itr in range(args.epoch):
+        st = time.time()
 
-		### Training ###
-		model.train()
-		for _ in range(num_batches):
-			optimizer.zero_grad()
-			# utils.update_learning_rate(optimizer, decay_rate = 0.999, lowest = args.lr / 10)
-			batch_dict = utils.get_next_batch(data_obj["train_dataloader"])
-   
-            # (!!!) 假设 compute_all_losses 内部调用 model.forecasting(...)
-			train_res = compute_all_losses(model, batch_dict, args.dataset)
-			
-			if train_res["loss"] is not None:
-				train_res["loss"].backward()
-				optimizer.step()
+        ### Training ###
+        model.train()
+        for _ in range(num_batches):
+            optimizer.zero_grad()
+            # utils.update_learning_rate(optimizer, decay_rate = 0.999, lowest = args.lr / 10)
+            batch_dict = utils.get_next_batch(data_obj["train_dataloader"])
+            # 假设 compute_all_losses 内部调用 model.forecasting(...)
+            train_res = compute_all_losses(model, batch_dict, args.dataset)
+            
+            if train_res["loss"] is not None:
+                train_res["loss"].backward()
+                optimizer.step()
 
-		### Validation ###
-		model.eval()
-		with torch.no_grad():
-            # (!!!) 假设 evaluation 内部调用 model.forecasting(...)
-			val_res = evaluation(model, data_obj["val_dataloader"], data_obj["n_val_batches"])
-			
-			### Testing ###
-			if(val_res["mse"] < best_val_mse):
-				best_val_mse = val_res["mse"]
-				best_iter = itr
-				test_res = evaluation(model, data_obj["test_dataloader"], data_obj["n_test_batches"])
-			
-			logger.info('- Epoch {:03d}, ExpID {}'.format(itr, experimentID))
-			logger.info("Train - Loss (one batch): {:.5f}".format(train_res["loss"].item() if train_res["loss"] is not None else -1))
-			logger.info("Val - Loss, MSE, RMSE, MAE, MAPE: {:.5f}, {:.5f}, {:.5f}, {:.5f}, {:.2f}%" \
-				.format(val_res["loss"], val_res["mse"], val_res["rmse"], val_res["mae"], val_res["mape"]*100))
-			if(test_res != None):
-				logger.info("Test - Best epoch, Loss, MSE, RMSE, MAE, MAPE: {}, {:.5f}, {:.5f}, {:.5f}, {:.5f}, {:.2f}%" \
-					.format(best_iter, test_res["loss"], test_res["mse"],\
-			 		 test_res["rmse"], test_res["mae"], test_res["mape"]*100))
-			logger.info("Time spent: {:.2f}s".format(time.time()-st))
+        ### Validation ###
+        model.eval()
+        with torch.no_grad():
+            # 假设 evaluation 内部调用 model.forecasting(...)
+            val_res = evaluation(model, data_obj["val_dataloader"], data_obj["n_val_batches"])
+            
+            ### Testing ###
+            if(val_res["mse"] < best_val_mse):
+                best_val_mse = val_res["mse"]
+                best_iter = itr
+                test_res = evaluation(model, data_obj["test_dataloader"], data_obj["n_test_batches"])
+            
+            logger.info('- Epoch {:03d}, ExpID {}'.format(itr, experimentID))
+            logger.info("Train - Loss (one batch): {:.5f}".format(train_res["loss"].item() if train_res["loss"] is not None else -1))
+            logger.info("Val - Loss, MSE, RMSE, MAE, MAPE: {:.5f}, {:.5f}, {:.5f}, {:.5f}, {:.2f}%"
+                .format(val_res["loss"], val_res["mse"], val_res["rmse"], val_res["mae"], val_res["mape"]*100))
+            if(test_res != None):
+                logger.info("Test - Best epoch, Loss, MSE, RMSE, MAE, MAPE: {}, {:.5f}, {:.5f}, {:.5f}, {:.5f}, {:.2f}%"
+                    .format(best_iter, test_res["loss"], test_res["mse"],
+                         test_res["rmse"], test_res["mae"], test_res["mape"]*100))
+            logger.info("Time spent: {:.2f}s".format(time.time()-st))
 
-		if(itr - best_iter >= args.patience):
-			print("Exp has been early stopped!")
-			sys.exit(0)
+        if(itr - best_iter >= args.patience):
+            print("Exp has been early stopped!")
+            sys.exit(0)

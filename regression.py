@@ -75,11 +75,19 @@ parser.add_argument('--mask_rate', type=float, default=0.3)
 parser.add_argument('--collate', type=str, default='indseq')
 
 # ==================================================================================
-# (!!!) 新增参数: 用于 Qwen + LoRA
+# (!!!) 新增/修改的参数: 用于 Qwen + LoRA
 # ==================================================================================
 parser.add_argument('--plm_path', type=str, default='Qwen/Qwen2-1.5B-Instruct', help="Path to Qwen2 model")
+parser.add_argument('--use_lora', action='store_true', help="[ADDED] Enable LoRA") 
 parser.add_argument('--lora_r', type=int, default=8, help="LoRA rank")
 parser.add_argument('--lora_alpha', type=int, default=16, help="LoRA alpha")
+parser.add_argument('--lora_dropout', type=float, default=0.1, help="[ADDED] LoRA dropout") 
+
+# ==================================================================================
+# (!!!) 新增参数: 用于 ISTS-PLM (plm4ts.py 需要)
+# ==================================================================================
+parser.add_argument('--patch_len', type=int, default=16, help="[ADDED] Patch length for value embedding") 
+parser.add_argument('--prompt_len', type=int, default=10, help="[ADDED] Prompt length") 
 # ==================================================================================
 
 
@@ -142,7 +150,7 @@ if __name__ == '__main__':
 	
 	### Model Config ###
 	if(args.model == 'istsplm_forecast'):
-        # (!!!) 确保 'istsplm_forecast' 已在 plm4ts.py 中被修改
+        # (!!!) 确保 'istsplm_forecast' 已在 plm4ts.py 中被定义
 		model = istsplm_forecast(args).to(args.device)
 	elif(args.model == 'istsplm_vector_forecast'):
 		model = istsplm_vector_forecast(args).to(args.device)

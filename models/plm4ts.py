@@ -75,32 +75,70 @@ class CTRoPERotaryEmbedding(nn.Module):
 # ==================================================================================
 
 class CustomQwen2Attention(Qwen2Attention):
-    """修改后的 Qwen2Attention，用于使用 CTRoPERotaryEmbedding"""
+    """
+    修改后的 Qwen2Attention，用于使用 CTRoPERotaryEmbedding
+    (!!!) 这是修复 `AttributeError: 'CustomQwen2Attention' object has no attribute 'num_heads'` 的地方 (!!!)
+    """
+    
     def __init__(self, config: Qwen2Config, layer_idx: Optional[int] = None):
-        super().__init__(config, layer_idx)
+        
+        # 1. 遵循你在 CustomQwen2DecoderLayer 中的模式，仅调用 nn.Module 的 __init__
+        super(Qwen2Attention, self).__init__() 
+        
+        # 2. 手动从 config 复制所有 Qwen2Attention 必需的属性
+        # (!!!) 这是你出错的地方：你缺少了 num_heads, head_dim 等 (!!!)
+        self.config = config
+        self.layer_idx = layer_idx
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.max_position_embeddings = config.max_position_embeddings
+        self.rope_theta = config.rope_theta
+        self.attention_dropout = config.attention_dropout
+
+        # 3. 手动定义 Qwen2Attention 中的线性层
+        # (PEFT 稍后会找到并替换它们)
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
+
+        # 4. 用你的自定义 RoPE 替换
         self.rotary_emb = CTRoPERotaryEmbedding(
             self.head_dim, config.max_position_embeddings, config.rope_theta,
         )
+
     def forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, output_attentions=False, use_cache=False, **kwargs):
         if "timestamps" not in kwargs:
             raise ValueError("CustomQwen2Attention 必须接收 'timestamps' 参数")
         timestamps = kwargs["timestamps"]
+        
         bsz, q_len, _ = hidden_states.size()
+        
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
+        
+        # (!!!) 修复后，self.num_heads 和 self.head_dim 将在这里存在 (!!!)
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
+            
         cos, sin = self.rotary_emb(value_states, timestamps=timestamps)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids=None)
+        
         if past_key_value is not None:
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
+            
         past_key_value = (key_states, value_states) if use_cache else None
+        
         key_states = self._repeat_kv(key_states, self.num_key_value_groups)
         value_states = self._repeat_kv(value_states, self.num_key_value_groups)
         
@@ -121,8 +159,10 @@ class CustomQwen2Attention(Qwen2Attention):
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
         attn_output = self.o_proj(attn_output)
+        
         if not output_attentions:
             attn_weights = None
+            
         return attn_output, attn_weights, past_key_value
 
 class CustomQwen2DecoderLayer(Qwen2DecoderLayer):
@@ -318,8 +358,7 @@ class istsplm_forecast(nn.Module):
         self.gpts.append(variable_aware_plm)
             
         # --- 4. 预测头 (Forecasting Head) ---
-        self.ln_proj = nn.LayerNorm(self.d_model) # <--- 注意: 这个 LayerNorm 没报错，因为它处理的是 375 行的 'outputs'
-                                                    # 它是在 PLM 之外的，并且输入类型可能是 float32
+        self.ln_proj = nn.LayerNorm(self.d_model) # <--- 注意: 这个 LayerNorm 没报错
         
         # Qwen 的输出将是 (B, D * d_model)
         qwen_output_dim = self.d_model * self.n_var 

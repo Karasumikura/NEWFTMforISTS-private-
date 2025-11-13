@@ -2,16 +2,12 @@ import math
 from typing import Optional, Tuple
 import torch
 import torch.nn as nn
-from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM, AutoModel
 from peft import get_peft_model, LoraConfig, TaskType
 
 
 class ValueEmbeddingQwen(nn.Module):
-    """
-    Projects scalar values to d_model.
-    Input shape: (B*D, L, 1)
-    Output shape: (B*D, L, d_model)
-    """
+    """Projects scalar values (B*D, L, 1) -> (B*D, L, d_model)"""
     def __init__(self, c_in: int, d_model: int):
         super().__init__()
         self.proj = nn.Linear(c_in, d_model)
@@ -20,19 +16,31 @@ class ValueEmbeddingQwen(nn.Module):
         return self.proj(x.float())
 
 
+class TimeMLP(nn.Module):
+    """Embed normalized scalar time -> d_model"""
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(1, d_model),
+            nn.SiLU(),
+            nn.Linear(d_model, d_model),
+        )
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        # t: (..., 1)
+        return self.net(t)
+
+
 class istsplm_forecast(nn.Module):
     """
-    ISTS forecasting model using a two-stage PLM pipeline (time-level + variable-level) based on Qwen2.5.
-    - Continuous Time Rotary Position Embeddings (CT-RoPE) injected by wrapping each self_attn.forward.
-    - Pure float32 pipeline for simplicity.
-    - LoRA optional (applied only on q_proj/k_proj/v_proj/o_proj).
-    Batch dict expected keys:
-        observed_data: (B, L_obs, D)
-        observed_mask: (B, L_obs, D)
-        observed_tp:   (B, L_obs) or (B, 1, L_obs)
-        tp_to_predict: (B, L_pred)
-        data_to_predict: (B, L_pred, D)
-        mask_predicted_data: (B, L_pred, D)
+    Hybrid ISTS-PLM:
+      - Time branch: Qwen2.5 (decoder-only), with CT-RoPE (continuous timestamps).
+      - Variable branch: BERT (bidirectional encoder).
+    Training policy:
+      - Default: fully freeze both PLMs (train only small heads).
+      - --semi_freeze: only norm layers trainable in PLMs (like original).
+      - --use_lora: inject LoRA to Qwen only (train LoRA weights).
+      - --use_lora_bert: optionally inject LoRA to BERT too (off by default).
     """
     def __init__(self, args):
         super().__init__()
@@ -41,60 +49,120 @@ class istsplm_forecast(nn.Module):
         self.d_model = args.d_model
         self.num_types = args.num_types
         self.prompt_len = args.prompt_len
-        self.use_lora = args.use_lora
-        self.plm_name = args.plm_path
-        self.n_plm_layers = 2  # 0: time-level, 1: variable-level
+        self.use_lora = getattr(args, "use_lora", False)
+        self.use_lora_bert = getattr(args, "use_lora_bert", False)
+        self.semi_freeze = getattr(args, "semi_freeze", False)
+
+        self.qwen_path = args.plm_path
+        self.bert_path = getattr(args, "bert_path", "bert-base-uncased")
 
         # Embeddings
         self.value_emb = ValueEmbeddingQwen(1, self.d_model)
         self.var_emb = nn.Embedding(self.num_types, self.d_model)
         self.prompt_embed = nn.Parameter(torch.randn(1, self.prompt_len, self.d_model))
 
-        # Load Qwen2.5 in float32
-        self.config = AutoConfig.from_pretrained(self.plm_name, trust_remote_code=True)
-        self.config.use_cache = False  # no generation caching needed for batch forecasting
+        # Learnable time scaling for CT-RoPE
+        self.time_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
 
-        gpts = []
-        for _ in range(self.n_plm_layers):
-            base = AutoModelForCausalLM.from_pretrained(
-                self.plm_name,
-                trust_remote_code=True,
-                torch_dtype=torch.float32  # force float32
-            )
-            core = getattr(base, "model", base)  # some Qwen variants expose .model
-            core = self._inject_ctr_rope(core, verbose=False)
-            if self.use_lora:
-                core = self._apply_lora(self.args, core)
-            gpts.append(core)
+        # Time-aware head (concat variable rep and future time scalar)
+        self.var_time_mlp = nn.Sequential(
+            nn.Linear(self.d_model + 1, self.d_model),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.d_model, self.d_model),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.d_model, 1)
+        )
 
-        self.gpts = nn.ModuleList(gpts)
+        # Load Qwen2.5 (time branch) in float32
+        self.qwen_config = AutoConfig.from_pretrained(self.qwen_path, trust_remote_code=True)
+        self.qwen_config.use_cache = False
+        qwen_base = AutoModelForCausalLM.from_pretrained(
+            self.qwen_path,
+            trust_remote_code=True,
+            torch_dtype=torch.float32
+        )
+        self.qwen = getattr(qwen_base, "model", qwen_base)
+        self.qwen = self._inject_ctr_rope(self.qwen, verbose=False)
 
-        # Projection and forecasting head
+        # Load BERT (variable branch) in float32
+        self.bert = AutoModel.from_pretrained(self.bert_path, torch_dtype=torch.float32)
+        self.bert_hidden = self.bert.config.hidden_size
+
+        # Bridge between Qwen d_model and BERT hidden
+        if self.bert_hidden != self.d_model:
+            self.proj_to_bert = nn.Linear(self.d_model, self.bert_hidden)
+            self.proj_from_bert = nn.Linear(self.bert_hidden, self.d_model)
+        else:
+            self.proj_to_bert = nn.Identity()
+            self.proj_from_bert = nn.Identity()
+
+        # Freeze/LoRA policies
+        self._apply_freeze_policies()
+
+        # Projection after time-PLM pooling
         self.ln_proj = nn.LayerNorm(self.d_model)
+
+        # Old constant head kept for ablation (unused by default)
         self.forecasting_head = nn.Sequential(
             nn.Linear(self.d_model, self.d_model // 2),
             nn.LeakyReLU(),
             nn.Linear(self.d_model // 2, self.num_types)
         )
 
-    # ---------------- LoRA ----------------
-    def _apply_lora(self, args, core_model):
+    # ---------------- Freeze / LoRA ----------------
+    def _apply_lora_qwen(self, args, model):
         target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
         lora_cfg = LoraConfig(
-            r=args.lora_r,
-            lora_alpha=args.lora_alpha,
-            target_modules=target_modules,
-            lora_dropout=args.lora_dropout,
-            bias="none",
-            task_type=TaskType.CAUSAL_LM
+            r=args.lora_r, lora_alpha=args.lora_alpha,
+            target_modules=target_modules, lora_dropout=args.lora_dropout,
+            bias="none", task_type=TaskType.CAUSAL_LM
         )
-        core_model = get_peft_model(core_model, lora_cfg)
-        for n, p in core_model.named_parameters():
+        model = get_peft_model(model, lora_cfg)
+        for n, p in model.named_parameters():
             if "lora" not in n:
                 p.requires_grad = False
-        return core_model
+        return model
 
-    # ---------------- CT-RoPE Injection ----------------
+    def _apply_lora_bert(self, args, model):
+        # Apply LoRA to BERT attention and FFN dense layers
+        target_modules = ["query", "key", "value", "dense"]
+        lora_cfg = LoraConfig(
+            r=args.lora_r, lora_alpha=args.lora_alpha,
+            target_modules=target_modules, lora_dropout=args.lora_dropout,
+            bias="none", task_type=TaskType.CAUSAL_LM
+        )
+        model = get_peft_model(model, lora_cfg)
+        for n, p in model.named_parameters():
+            if "lora" not in n:
+                p.requires_grad = False
+        return model
+
+    def _apply_freeze_policies(self):
+        # Qwen policy
+        if self.use_lora:
+            self.qwen = self._apply_lora_qwen(self.args, self.qwen)
+        else:
+            self._freeze_or_semi(self.qwen, semi=self.semi_freeze)
+
+        # BERT policy
+        if self.use_lora_bert:
+            self.bert = self._apply_lora_bert(self.args, self.bert)
+        else:
+            self._freeze_or_semi(self.bert, semi=self.semi_freeze)
+
+    @staticmethod
+    def _freeze_or_semi(model: nn.Module, semi: bool):
+        def is_norm(name: str):
+            lname = name.lower()
+            return ("layernorm" in lname) or ("ln" in lname) or ("norm" in lname)
+        if not semi:
+            for _, p in model.named_parameters():
+                p.requires_grad = False
+        else:
+            for n, p in model.named_parameters():
+                p.requires_grad = is_norm(n)
+
+    # ---------------- CT-RoPE Injection for Qwen ----------------
     def _inject_ctr_rope(self, core_model, verbose: bool = True):
         if not hasattr(core_model, "layers"):
             raise ValueError("Qwen2.5 core model has no 'layers' attribute.")
@@ -155,14 +223,20 @@ class istsplm_forecast(nn.Module):
                 if past_key_value is not None:
                     kv_seq_len += past_key_value[0].shape[-2]
 
-                # CT-RoPE with continuous timestamps
-                if rotary_emb is not None:
+                # CT-RoPE with normalized timestamps + learnable scale
+                if rotary_emb is not None and timestamps is not None:
+                    tmin = timestamps.min(dim=-1, keepdim=True).values
+                    tmax = timestamps.max(dim=-1, keepdim=True).values
+                    tptp = torch.clamp(tmax - tmin, min=1e-8)
+                    t_norm = (timestamps - tmin) / tptp
+                    t_scaled = t_norm * self.time_scale
+
                     cos, sin = rotary_emb(v, seq_len=kv_seq_len)
-                    if timestamps is not None:
-                        ts = timestamps.unsqueeze(1).unsqueeze(-1).to(k.dtype)
-                        q, k = apply_rotary_pos_emb(q, k, cos, sin, ts)
-                    elif position_ids is not None:
-                        q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+                    ts = t_scaled.unsqueeze(1).unsqueeze(-1).to(k.dtype)
+                    q, k = apply_rotary_pos_emb(q, k, cos, sin, ts)
+                elif rotary_emb is not None and position_ids is not None:
+                    cos, sin = rotary_emb(v, seq_len=kv_seq_len)
+                    q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
 
                 if past_key_value is not None:
                     k = torch.cat([past_key_value[0], k], dim=2)
@@ -211,20 +285,19 @@ class istsplm_forecast(nn.Module):
 
     # ---------------- Forecasting ----------------
     def forecasting(self, batch_dict, n_vars_to_predict=None):
-        observed_data = batch_dict["observed_data"].to(self.device).float()    # (B, L_obs, D)
-        observed_mask = batch_dict["observed_mask"].to(self.device).float()    # (B, L_obs, D)
-        observed_tp_raw = batch_dict["observed_tp"].to(self.device).float()    # (B, L_obs) or (B, 1, L_obs)
-        tp_to_predict = batch_dict["tp_to_predict"].to(self.device)            # (B, L_pred)
+        observed_data = batch_dict["observed_data"].to(self.device).float()   # (B, L_obs, D)
+        observed_mask = batch_dict["observed_mask"].to(self.device).float()   # (B, L_obs, D)
+        observed_tp_raw = batch_dict["observed_tp"].to(self.device).float()   # (B, L_obs) or (B, 1, L_obs)
+        tp_to_predict = batch_dict["tp_to_predict"].to(self.device).float()   # (B, L_pred)
 
         B, L_obs, D = observed_data.shape
         L_pred = tp_to_predict.shape[1]
 
-        # Value embeddings per variable
-        x_flat = observed_data.permute(0, 2, 1).reshape(B * D, L_obs, 1).float()
-        value_embed = self.value_emb(x_flat)  # (B*D, L_obs, d_model)
+        # 1) Time branch (Qwen) per variable
+        x_flat = observed_data.permute(0, 2, 1).reshape(B * D, L_obs, 1)
+        value_embed = self.value_emb(x_flat)  # (B*D, L_obs, H)
         L_val = value_embed.size(1)
 
-        # Align timestamps length
         observed_tp = observed_tp_raw.reshape(B, -1)
         L_time = observed_tp.size(1)
         if L_time != L_val:
@@ -238,14 +311,12 @@ class istsplm_forecast(nn.Module):
 
         tt = tp_aligned.unsqueeze(1).expand(B, D, L_val).reshape(B * D, L_val)
 
-        # Prompt + concat
         prompt = self.prompt_embed.expand(B * D, -1, -1).float()
-        inputs_embeds = torch.cat([prompt, value_embed], dim=1)  # (B*D, prompt_len + L_val, d_model)
+        inputs_embeds = torch.cat([prompt, value_embed], dim=1)  # (B*D, prompt+L_val, H)
 
         tt_prompt = torch.zeros(B * D, self.prompt_len, device=self.device)
-        tt_with_prompt = torch.cat([tt_prompt, tt], dim=1)  # (B*D, prompt_len + L_val)
+        tt_with_prompt = torch.cat([tt_prompt, tt], dim=1)       # (B*D, total_len)
 
-        # Time mask
         time_mask_flat = observed_mask.permute(0, 2, 1).reshape(B * D, L_obs)
         if L_obs != L_val:
             if L_obs >= L_val:
@@ -259,16 +330,15 @@ class istsplm_forecast(nn.Module):
         additive_mask = (1.0 - time_mask) * torch.finfo(torch.float32).min
         additive_mask = additive_mask.unsqueeze(1).unsqueeze(1)  # (B*D,1,1,total_len)
 
-        # Time PLM forward (no cache)
-        out_time = self.gpts[0](
+        out_time = self.qwen(
             inputs_embeds=inputs_embeds,
             attention_mask=additive_mask,
             timestamps=tt_with_prompt,
             use_cache=False,
             output_attentions=False
-        ).last_hidden_state  # (B*D, total_len, d_model)
+        ).last_hidden_state  # (B*D, total_len, H)
 
-        # Masked pooling (remove prompt portion)
+        # Masked pooling on observed tokens (exclude prompt)
         mask_pool = observed_mask.permute(0, 2, 1).reshape(B * D, L_obs, 1)
         if L_obs != L_val:
             if L_obs >= L_val:
@@ -277,34 +347,46 @@ class istsplm_forecast(nn.Module):
                 padm2 = torch.zeros(B * D, L_val - L_obs, 1, device=self.device)
                 mask_pool = torch.cat([mask_pool, padm2], dim=1)
 
-        out_val = out_time[:, self.prompt_len:]  # (B*D, L_val, d_model)
+        out_val = out_time[:, self.prompt_len:]  # (B*D, L_val, H)
         denom = mask_pool.sum(dim=1, keepdim=True) + 1e-8
-        pooled = (out_val * mask_pool).sum(dim=1) / denom.squeeze(1)  # (B*D, d_model)
-        pooled = self.ln_proj(pooled).view(B, D, -1)  # (B, D, d_model)
+        pooled = (out_val * mask_pool).sum(dim=1) / denom.squeeze(1)  # (B*D, H)
+        pooled = self.ln_proj(pooled).view(B, D, -1)                   # (B, D, H)
 
-        # Variable-level PLM input
-        var_emb = self.var_emb.weight.unsqueeze(0).expand(B, D, -1).float()
-        var_inputs = pooled + var_emb
-        var_attn_mask = torch.zeros(B, D, D, device=self.device).unsqueeze(1)  # (B,1,D,D)
-        position_ids = torch.arange(D, device=self.device).unsqueeze(0).expand(B, D)
+        # 2) Variable branch (BERT)
+        var_in = pooled + self.var_emb.weight.unsqueeze(0).expand(B, D, -1).float()  # (B, D, H)
+        var_in_bert = self.proj_to_bert(var_in)  # (B, D, bert_hidden)
 
-        out_var = self.gpts[1](
-            inputs_embeds=var_inputs,
-            attention_mask=var_attn_mask,
-            position_ids=position_ids,
-            use_cache=False,
-            output_attentions=False
-        ).last_hidden_state  # (B, D, d_model)
+        # BERT expects attention_mask: (B, D) of 1/0
+        attn_mask_bert = torch.ones(B, D, device=self.device, dtype=torch.long)
+        position_ids_bert = torch.arange(D, device=self.device).unsqueeze(0).expand(B, D)
 
-        # Forecast head
-        forecast_vars = self.forecasting_head(out_var)  # (B, D, D)
-        regression_value = forecast_vars[:, :, 0]       # (B, D)
-        forecast = regression_value.unsqueeze(1).expand(-1, L_pred, -1)  # (B, L_pred, D)
+        bert_out = self.bert(
+            inputs_embeds=var_in_bert,
+            attention_mask=attn_mask_bert,
+            position_ids=position_ids_bert
+        ).last_hidden_state  # (B, D, bert_hidden)
+
+        out_var = self.proj_from_bert(bert_out)  # (B, D, H)
+
+        # 3) Time-aware forecasting per variable
+        # Normalize future times from observed min/max (per-batch)
+        tmin_obs = observed_tp.min(dim=1, keepdim=True).values  # (B,1)
+        tmax_obs = observed_tp.max(dim=1, keepdim=True).values  # (B,1)
+        tptp_obs = torch.clamp(tmax_obs - tmin_obs, min=1e-8)
+        tpred_norm = torch.clamp((tp_to_predict - tmin_obs) / tptp_obs, 0.0, 1.0)  # (B, L_pred)
+
+        # Broadcast for concat: (B, L_pred, 1), (B, D, H) -> (B, L_pred, D, H+1)
+        tpred_scalar = tpred_norm.unsqueeze(-1)            # (B, L_pred, 1)
+        var_rep = out_var.unsqueeze(1).expand(-1, L_pred, -1, -1)
+        time_rep = tpred_scalar.unsqueeze(2).expand(-1, -1, D, -1)
+        fused = torch.cat([var_rep, time_rep], dim=-1)     # (B, L_pred, D, H+1)
+
+        pred = self.var_time_mlp(fused).squeeze(-1)        # (B, L_pred, D)
 
         if n_vars_to_predict is not None:
-            forecast = forecast[:, :, :n_vars_to_predict]
+            pred = pred[:, :, :n_vars_to_predict]
 
-        return forecast.float()
+        return pred.float()
 
     def forward(self, batch_dict, n_vars_to_predict=None):
         return self.forecasting(batch_dict, n_vars_to_predict)

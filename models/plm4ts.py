@@ -62,6 +62,18 @@ class VariableEmbedding_Qwen(nn.Module):
 
 # 沿用了 Qwen2Attention 的结构，但修改了 RoPE 的应用方式
 class CTRoPEQwen2Attention(Qwen2Attention):
+    def __init__(self, config: Qwen2Config, layer_idx: int):
+        # 显式调用父类初始化，确保 num_heads / head_dim / hidden_size 等属性被设置
+        super().__init__(config, layer_idx)
+
+    def _repeat_kv(self, kv: torch.Tensor, n_rep: int) -> torch.Tensor:
+        # 将 KV 头从 num_kv_heads 重复到 num_heads
+        # kv: (B, num_kv_heads, L, head_dim)
+        if n_rep == 1:
+            return kv
+        bsz, n_kv, seqlen, hd = kv.shape
+        return kv.unsqueeze(2).expand(bsz, n_kv, n_rep, seqlen, hd).reshape(bsz, n_kv * n_rep, seqlen, hd)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -81,9 +93,10 @@ class CTRoPEQwen2Attention(Qwen2Attention):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        # 注意：Qwen2 使用 GQA，q 用 num_heads，k/v 用 num_key_value_heads
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)                  # (B, H, L, hd)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)            # (B, H_kv, L, hd)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)        # (B, H_kv, L, hd)
 
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
@@ -92,13 +105,9 @@ class CTRoPEQwen2Attention(Qwen2Attention):
         # CT-RoPE 应用: 使用连续时间戳 (timestamps) 而不是 position_ids
         if timestamps is not None:
             # timestamps: (B, L)
-            # 使用 timestamps 作为位置索引进行旋转
-            
             cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-            
             # 扩展 timestamps 以匹配 RoPE 接口所需的形状 (B, 1, L, 1)
             timestamps_exp = timestamps.unsqueeze(1).unsqueeze(-1).to(key_states.dtype)
-            
             query_states, key_states = apply_rotary_pos_emb(
                 query_states, key_states, cos, sin, timestamps_exp
             )
@@ -114,29 +123,30 @@ class CTRoPEQwen2Attention(Qwen2Attention):
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
             value_states = torch.cat([past_key_value[1], value_states], dim=2)
 
+        # 将 KV 头重复到与 Q 头一致
+        if self.num_key_value_heads != self.num_heads:
+            n_rep = self.num_heads // self.num_key_value_heads
+            key_states = self._repeat_kv(key_states, n_rep)
+            value_states = self._repeat_kv(value_states, n_rep)
+
         past_key_value = (key_states, value_states) if use_cache else None
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
-        # [FIX 2: RuntimeError] 修复 use_cache=True (预测阶段) 时的 attention mask 切片问题
+        # attention_mask 形状通常为 (B, 1, q_len, kv_len) 或 (B, 1, 1, kv_len)，可广播
         if attention_mask is not None:
             if cache_position is not None:
-                # attention_mask shape is typically (B, 1, L_kv, L_kv). 
-                # We need to slice the L_kv rows corresponding to q_len (q_len is small in generation).
-                attention_mask_kv_len = attention_mask.shape[-2]
-                if q_len != attention_mask_kv_len:
-                    # 获取需要保留的行的起始索引
-                    start_row = attention_mask_kv_len - q_len
-                    # 仅保留 attention_mask 中对应 q_len 的行
+                # 如果处于缓存生成阶段，确保 mask 的第 -2 维（q_len）对齐
+                mask_q_len = attention_mask.shape[-2]
+                if q_len != mask_q_len:
+                    start_row = mask_q_len - q_len
                     attention_mask = attention_mask[:, :, start_row:, :]
-
             attn_weights = attn_weights + attention_mask
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_weights = self.attn_dropout(attn_weights)
 
-        attn_output = torch.matmul(attn_weights, value_states)
+        attn_output = torch.matmul(attn_weights, value_states)  # (B, H, q_len, hd)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
@@ -144,8 +154,8 @@ class CTRoPEQwen2Attention(Qwen2Attention):
                 f" {attn_output.size()}"
             )
 
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        attn_output = attn_output.transpose(1, 2).contiguous()               # (B, q_len, H, hd)
+        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)      # (B, q_len, hidden_size)
 
         attn_output = self.o_proj(attn_output)
 
@@ -326,7 +336,6 @@ def inject_CTRoPE_to_model(model: PreTrainedModel):
             new_attn.o_proj.weight.data.copy_(module.o_proj.weight.data)
             
             # [FIX 7: NoneType bias] 修复了 bias 复制错误
-            # 必须为每个 proj 单独检查 bias 是否存在
             if module.q_proj.bias is not None:
                 new_attn.q_proj.bias.data.copy_(module.q_proj.bias.data)
             if module.k_proj.bias is not None:
@@ -338,11 +347,8 @@ def inject_CTRoPE_to_model(model: PreTrainedModel):
             
             # 替换模块
             setattr(model, name, new_attn)
-            
-        # 递归地检查子模块
         else:
             inject_CTRoPE_to_model(module)
-            
     return model
 
 
@@ -376,7 +382,6 @@ def configure_lora(args, model: PLM4TS_Base):
 # ==================================================================================
 
 class istsplm_forecast(nn.Module):
-    # [FIX 3] 匹配 regression.py 中的类名
     def __init__(self, args):
         super(istsplm_forecast, self).__init__() 
 
@@ -386,7 +391,6 @@ class istsplm_forecast(nn.Module):
         self.dropout = args.dropout
         self.use_lora = args.use_lora
         
-        # [FIX 4 - ArgError] 修复参数不匹配
         self.plm_name = args.plm_path 
         self.num_types = args.num_types # D 维度 (变量数)
         self.n_plm_layers = 2 # 明确指定两个PLM：一个用于时间，一个用于变量
@@ -394,40 +398,30 @@ class istsplm_forecast(nn.Module):
         # 1. 配置
         self.config = AutoConfig.from_pretrained(self.plm_name, trust_remote_code=True)
         self.config.use_cache = True 
-        # 在这里不覆盖 num_hidden_layers，因为我们只加载两个模型实例，但它们会继承原始配置
         
         # 2. Embedding 层
-        # Value Embedding (将 1 维值投影到 d_model)
         self.value_embedding = ValueEmbedding_Qwen(1, self.d_model)
-        # Variable Embedding (为 D 个变量创建 embedding)
         self.var_embedding = nn.Embedding(self.num_types, self.d_model)
 
         # 3. PLM 模块 (两个独立的 PLM 实例)
         gpts = []
         for i in range(self.n_plm_layers):
-            # 3a. 使用 .from_pretrained() 加载预训练模型 (FIX 6: load_weights)
             model = PLM4TS_Base.from_pretrained(
                 self.plm_name,
                 config=self.config,
                 ignore_mismatched_sizes=True,
                 trust_remote_code=True
             )
-            
-            # 3b. 注入 CT-RoPE
             model = inject_CTRoPE_to_model(model)
-            
-            # 3c. 应用 LoRA
             if args.use_lora:
                 model = configure_lora(args, model)
-                
             gpts.append(model)
+        self.gpts = nn.ModuleList(gpts) # gpts[0] 时间PLM，gpts[1] 变量PLM
         
-        self.gpts = nn.ModuleList(gpts) # gpts[0] 是时间PLM，gpts[1] 是变量PLM
-        
-        # 4. Projection Layer (池化后的输出投影层)
+        # 4. Projection Layer
         self.ln_proj = nn.LayerNorm(self.d_model)
         
-        # 5. Forecasting Head (预测头)
+        # 5. Forecasting Head
         self.forecasting_head = nn.Sequential(
             nn.Linear(self.d_model, self.d_model // 2),
             nn.LeakyReLU(),
@@ -437,14 +431,10 @@ class istsplm_forecast(nn.Module):
         # 6. Prompt/Patch Embedding 
         self.patch_len = args.patch_len
         self.prompt_len = args.prompt_len
-        # (1, L_prompt, d_model)
         self.prompt_embed = nn.Parameter(torch.randn(1, self.prompt_len, self.d_model))
         
 
     def forecasting(self, batch_dict, n_vars_to_predict=None):
-        # [FIX 5: KeyError & FIX 7: evaluation.py 接口]
-        # 现在接收 batch_dict 和 n_vars_to_predict
-        
         observed_data = batch_dict["observed_data"].to(self.device) # (B, L_obs, D)
         observed_mask = batch_dict["observed_mask"].to(self.device) # (B, L_obs, D)
         observed_tp_raw = batch_dict["observed_tp"].to(self.device) # (B, L_obs) 或 (B, 1, L_obs)
@@ -453,22 +443,14 @@ class istsplm_forecast(nn.Module):
         B, L_obs, D = observed_data.shape
         L_pred = tp_to_predict.shape[1]
 
-        # ----------------------------------------------------
-        # 步骤 1: 准备输入 (时间 PLM)
-        # ----------------------------------------------------
-        
         # 1a. Value Embedding
-        # 将 (B, L_obs, D) 转换为 (B*D, L_obs, 1) 以进行时间 PLM (每个变量独立)
         x_flat = observed_data.permute(0, 2, 1).reshape(B * D, L_obs, 1) 
-        # 投影到隐藏层维度 (B*D, L_obs, d_model)
-        value_embed = self.value_embedding(x_flat) 
+        value_embed = self.value_embedding(x_flat)  # (B*D, L_val, d_model)
+        L_val = value_embed.size(1)
 
         # 1b. Times Embedding (CT-RoPE)
-        # 将 observed_tp 统一成二维 (B, ?)，兼容 (B, L_obs) 与 (B, 1, L_obs)
         observed_tp = observed_tp_raw.reshape(B, -1)  # (B, L_time_raw)
-        # 对齐时间步长度到 value_embed 的序列长度
-        L_val = value_embed.size(1)   # 由值序列决定的长度 (应等于 L_obs)
-        L_time = observed_tp.size(1)  # 由时间戳决定的长度
+        L_time = observed_tp.size(1)
         if L_time != L_val:
             if L_time >= L_val:
                 observed_tp_aligned = observed_tp[:, -L_val:]
@@ -478,7 +460,6 @@ class istsplm_forecast(nn.Module):
         else:
             observed_tp_aligned = observed_tp
 
-        # 复制 observed_tp_aligned，使其与 (B*D) 批次大小匹配
         tt = observed_tp_aligned.unsqueeze(1).expand(B, D, L_val).reshape(B * D, L_val)
         
         # 1c. 添加 Prompt/Prefix
@@ -490,9 +471,7 @@ class istsplm_forecast(nn.Module):
         tt_with_prompt = torch.cat([tt_prompt, tt], dim=1) # (B*D, L_prompt + L_val)
         
         # 1d. Attention Mask (忽略 Prompt)
-        # 使用每个变量自己的 mask，形状对齐到 (B*D, L_val)
         time_attn_mask_data_flat = observed_mask.permute(0, 2, 1).reshape(B * D, L_obs) # (B*D, L_obs)
-        # 若 L_obs != L_val，则截断或右侧补 0 对齐
         if L_obs != L_val:
             if L_obs >= L_val:
                 time_attn_mask_data_flat = time_attn_mask_data_flat[:, -L_val:]
@@ -502,28 +481,19 @@ class istsplm_forecast(nn.Module):
 
         time_attn_mask_prompt = torch.ones(B * D, self.prompt_len, device=self.device) # Prompt 完全可见
         time_attn_mask = torch.cat([time_attn_mask_prompt, time_attn_mask_data_flat], dim=1) # (B*D, L_total)
-        # 转换为 Qwen 所需的 additive mask (B*D, 1, 1, L_total); Qwen 内部有因果掩码
         time_attn_mask = (1.0 - time_attn_mask) * torch.finfo(torch.float32).min
         time_attn_mask = time_attn_mask.unsqueeze(1).unsqueeze(1) # (B*D, 1, 1, L_total)
         time_attn_mask = time_attn_mask.to(self.device)
 
-        # ----------------------------------------------------
-        # 步骤 2: PLM 1 (时间感知)
-        # ----------------------------------------------------
-        
+        # 2. PLM 1 (时间感知)
         outputs = self.gpts[0](
             inputs_embeds=inputs_embeds,
             attention_mask=time_attn_mask,
             timestamps=tt_with_prompt 
         ).last_hidden_state
 
-        # ----------------------------------------------------
-        # 步骤 3: Masked Pooling (掩码池化)
-        # ----------------------------------------------------
-        
-        # 重新引入 observed_mask
+        # 3. 掩码池化
         observed_mask_pooled = observed_mask.permute(0, 2, 1).reshape(B * D, L_obs, 1) # (B*D, L_obs, 1)
-        # 若 L_obs != L_val，同样对齐 mask 到 L_val，便于与 outputs_data 对齐
         if L_obs != L_val:
             if L_obs >= L_val:
                 observed_mask_pooled = observed_mask_pooled[:, -L_val:, :]
@@ -531,62 +501,32 @@ class istsplm_forecast(nn.Module):
                 pad_m3d = torch.zeros(B * D, L_val - L_obs, 1, device=self.device, dtype=observed_mask_pooled.dtype)
                 observed_mask_pooled = torch.cat([observed_mask_pooled, pad_m3d], dim=1)
         
-        # outputs shape: (B*D, L_prompt + L_val, d_model)
-        # 排除 Prompt 后的输出
         outputs_data = outputs[:, self.prompt_len:] # (B*D, L_val, d_model)
-        
-        # 应用掩码和求平均（跳过 Prompt 部分）
         n_nonmask = (observed_mask_pooled.sum(dim=1) + 1e-8) # (B*D, 1)
         outputs = (outputs_data * observed_mask_pooled).sum(dim=1) / n_nonmask # (B*D, d_model)
-        
-        # 投影和重塑回 (B, D, d_model)
         outputs = self.ln_proj(outputs).view(B, D, -1) # (B, D, d_model)
         
-        # ----------------------------------------------------
-        # 步骤 4: PLM 2 (变量感知)
-        # ----------------------------------------------------
-
-        # 4a. Variable Embedding 
+        # 4. PLM 2 (变量感知)
         var_embedding = self.var_embedding.weight.unsqueeze(0).expand(B, D, -1)
         outputs = outputs + var_embedding
-        
-        # 4b. Position IDs (离散位置索引)
         var_position_ids = torch.arange(D, device=self.device).unsqueeze(0).expand(B, D)
-        
-        # 4c. Variable Attention Mask (全连接)
-        # (B, 1, D, D)
-        var_attn_mask = torch.zeros(B, D, D, device=self.device, dtype=torch.float32)
-        var_attn_mask = var_attn_mask.masked_fill(var_attn_mask == 0, 0.0) # 确保无负无穷
-        var_attn_mask = var_attn_mask.unsqueeze(1) # (B, 1, D, D)
+        var_attn_mask = torch.zeros(B, D, D, device=self.device, dtype=torch.float32).unsqueeze(1) # (B, 1, D, D)
 
-        # 4d. PLM 2 执行 (不传递 timestamps)
         outputs = self.gpts[1](
             inputs_embeds=outputs,
             attention_mask=var_attn_mask,
             position_ids=var_position_ids 
         ).last_hidden_state # (B, D, d_model)
         
-        # ----------------------------------------------------
-        # 步骤 5: 预测
-        # ----------------------------------------------------
-        
-        # 预测头返回 D 维度的变量值 (B, D, D)
-        forecast_vars = self.forecasting_head(outputs) 
-
-        # 假设预测值是 D 维度中的第一个 (或平均值)
-        # 这里使用第一个维度作为回归预测值
-        regression_value = forecast_vars[:, :, 0] # (B, D)
-        
-        # 扩展到 L_pred 时间步 (ISTS-PLM 原有策略)
+        # 5. 预测
+        forecast_vars = self.forecasting_head(outputs)  # (B, D, D)
+        regression_value = forecast_vars[:, :, 0]       # (B, D)
         forecast = regression_value.unsqueeze(1).expand(-1, L_pred, -1) # (B, L_pred, D)
 
-        # 如果需要预测的变量维度少于 D
         if n_vars_to_predict is not None:
             forecast = forecast[:, :, :n_vars_to_predict]
 
         return forecast
 
-
     def forward(self, batch_dict, n_vars_to_predict=None):
-        # 允许 forward 和 forecasting 使用相同的签名
         return self.forecasting(batch_dict, n_vars_to_predict)

@@ -7,14 +7,12 @@ from typing import Optional, Tuple, Union, List
 
 # ==================================================================================
 # 第 1 部分：新模型 (Qwen / LoRA) 的依赖项
-# (!!!) 不再导入 GPT2Model_wope 或 BertModel_wope (!!!)
 # ==================================================================================
 from transformers import (
     AutoConfig, 
     PreTrainedModel, 
     Qwen2Model, 
     Qwen2Config, 
-    # BitsAndBytesConfig  <-- (!!!) 移除：不再需要 INT4
 )
 from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2Attention, 
@@ -77,7 +75,6 @@ class CTRoPERotaryEmbedding(nn.Module):
 class CustomQwen2Attention(Qwen2Attention):
     """
     修改后的 Qwen2Attention，用于使用 CTRoPERotaryEmbedding
-    (!!!) 这是修复 `AttributeError: 'CustomQwen2Attention' object has no attribute 'num_heads'` 的地方 (!!!)
     """
     
     def __init__(self, config: Qwen2Config, layer_idx: Optional[int] = None):
@@ -86,7 +83,6 @@ class CustomQwen2Attention(Qwen2Attention):
         super(Qwen2Attention, self).__init__() 
         
         # 2. 手动从 config 复制所有 Qwen2Attention 必需的属性
-        # (!!!) 这是你出错的地方：你缺少了 num_heads, head_dim 等 (!!!)
         self.config = config
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
@@ -99,11 +95,16 @@ class CustomQwen2Attention(Qwen2Attention):
         self.attention_dropout = config.attention_dropout
 
         # 3. 手动定义 Qwen2Attention 中的线性层
-        # (PEFT 稍后会找到并替换它们)
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
+        
+        # (!!!) 解决方案：
+        # 你的 config.json 文件太旧，没有 'attention_bias' 属性。
+        # 我们使用 getattr(..., True) 来设置默认值为 True (Qwen2 默认有偏置)。
+        bias_value = getattr(config, 'attention_bias', True) 
+        
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=bias_value)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=bias_value)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=bias_value)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=bias_value)
 
         # 4. 用你的自定义 RoPE 替换
         self.rotary_emb = CTRoPERotaryEmbedding(
@@ -121,7 +122,6 @@ class CustomQwen2Attention(Qwen2Attention):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
         
-        # (!!!) 修复后，self.num_heads 和 self.head_dim 将在这里存在 (!!!)
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -311,24 +311,18 @@ class istsplm_forecast(nn.Module):
         # --- 2. 加载模型 (预训练权重) ---
         plm_name = opt.plm_path
         
-        # (!!!) 移除：删除 BitsAndBytesConfig
-        # quantization_config = BitsAndBytesConfig(...)
-        
         print(f"正在从 {plm_name} 加载 Time-Aware PLM (CustomQwen2Model) [完整模型]...")
         time_aware_plm = CustomQwen2Model.from_pretrained(
             plm_name,
-            # quantization_config=quantization_config, # (!!!) 移除
             trust_remote_code=True,
             output_attentions=True,
             output_hidden_states=True
-            # (!!!) 注意: 加载完整模型可能需要指定 torch_dtype=torch.bfloat16 (如果内存不足)
             # torch_dtype=torch.bfloat16 
         )
         
         print(f"正在从 {plm_name} 加载 Variable-Aware PLM (Standard Qwen2Model) [完整模型]...")
         variable_aware_plm = Qwen2Model.from_pretrained(
             plm_name,
-            # quantization_config=quantization_config, # (!!!) 移除
             trust_remote_code=True,
             output_attentions=True,
             output_hidden_states=True
@@ -342,7 +336,6 @@ class istsplm_forecast(nn.Module):
             target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
             lora_dropout=0.1,
             bias="none",
-            # <--- (!!!) 修复点 4: 修复 `prepare_inputs_for_generation` 错误
             task_type=TaskType.FEATURE_EXTRACTION, 
         )
         
@@ -358,19 +351,13 @@ class istsplm_forecast(nn.Module):
         self.gpts.append(variable_aware_plm)
             
         # --- 4. 预测头 (Forecasting Head) ---
-        self.ln_proj = nn.LayerNorm(self.d_model) # <--- 注意: 这个 LayerNorm 没报错
+        self.ln_proj = nn.LayerNorm(self.d_model) 
         
-        # Qwen 的输出将是 (B, D * d_model)
         qwen_output_dim = self.d_model * self.n_var 
-        
-        # 要求的预测输出是 (B, pred_len * D)
         prediction_dim = self.pred_len * self.n_var
         
-        # 最终的预测头
         self.forecasting_head = nn.Linear(qwen_output_dim, prediction_dim)
         
-        # (!!!) 保留 'predict_decoder' 以防 'evaluation.py' 使用它
-        # 尽管我们的主 'forecasting' 不会用它。
         self.predict_decoder = nn.Sequential(
             nn.Linear(opt.d_model+1, opt.d_model),
             nn.ReLU(inplace=True),

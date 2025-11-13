@@ -20,8 +20,8 @@ class istsplm_forecast(nn.Module):
         super().__init__()
         self.args = args
         self.device = args.device
-        # 基础 d_model（可能在 auto_match_var_plm_dim 下被调整）
-        self.d_model = args.d_model
+            # 基础 d_model（可能在 auto_match_var_plm_dim 下被调整）
+            self.d_model = args.d_model
         self.num_types = args.num_types
 
         self.use_lora = getattr(args, "use_lora", False)
@@ -43,18 +43,20 @@ class istsplm_forecast(nn.Module):
         self.bert_path = getattr(args, "bert_path", "bert-base-uncased")
         self.st_plm_type = getattr(args, "st_plm_type", "bert")  # 'bert' | 'qwen'
 
-        self.qwen_config = AutoConfig.from_pretrained(self.qwen_path, trust_remote_code=True)
-        self.qwen_config.use_cache = False
-        # 若开启自动对齐并使用 qwen 作为第二阶段，强制 d_model 与 Qwen hidden 对齐
-        if getattr(args, 'auto_match_var_plm_dim', False) and getattr(args, 'st_plm_type', 'bert') == 'qwen':
-            if self.d_model != self.qwen_config.hidden_size:
-                self.d_model = self.qwen_config.hidden_size
-
-        # 初始化依赖 d_model 的嵌入（在可能调整维度之后）
         self.value_emb = ValueEmbedding(2, self.d_model)
         self.var_emb = nn.Embedding(self.num_types, self.d_model)
         # 保留旧的 time_scale 作为额外幅度因子
         self.time_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+
+        self.qwen_config = AutoConfig.from_pretrained(self.qwen_path, trust_remote_code=True)
+        self.qwen_config.use_cache = False
+            # 若开启自动对齐并使用 qwen 作为第二阶段，强制 d_model 与 Qwen hidden 对齐
+            if getattr(args, 'auto_match_var_plm_dim', False) and getattr(args, 'st_plm_type', 'bert') == 'qwen':
+                if self.d_model != self.qwen_config.hidden_size:
+                    self.d_model = self.qwen_config.hidden_size
+
+            # 重新根据可能更新后的 d_model 初始化依赖 d_model 的嵌入
+            # 注意：此调整需在加载 qwen backbone 之前
         qwen_base = AutoModelForCausalLM.from_pretrained(
             self.qwen_path,
             trust_remote_code=True,

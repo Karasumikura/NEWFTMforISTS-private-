@@ -1,332 +1,346 @@
-import gc
-import numpy as np
-import sklearn as sk
+import math
+from typing import Optional, Tuple
 import torch
 import torch.nn as nn
-from torch.nn.functional import relu
-
-import lib.utils as utils
-from lib.utils import get_device
-
-from torch.distributions.multivariate_normal import MultivariateNormal
-from torch.distributions.normal import Normal
-from torch.distributions import kl_divergence, Independent
+from transformers import AutoConfig, AutoModelForCausalLM
+from peft import get_peft_model, LoraConfig, TaskType
 
 
-# -------------------- Device Helper --------------------
-def to_device_batch(batch_dict, device):
-    for k, v in batch_dict.items():
-        if torch.is_tensor(v):
-            batch_dict[k] = v.to(device)
-    return batch_dict
+class ValueEmbeddingQwen(nn.Module):
+    def __init__(self, c_in: int, d_model: int):
+        super().__init__()
+        self.proj = nn.Linear(c_in, d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(x.float())
 
 
-def gaussian_log_likelihood(mu_2d, data_2d, obsrv_std, indices=None):
-    n_data_points = mu_2d.size()[-1]
-    if n_data_points > 0:
-        gaussian = Independent(Normal(loc=mu_2d, scale=obsrv_std.repeat(n_data_points)), 1)
-        log_prob = gaussian.log_prob(data_2d)
-        log_prob = log_prob / n_data_points
-    else:
-        log_prob = torch.zeros([1]).to(get_device(data_2d)).squeeze()
-    return log_prob
+class TimeMLP(nn.Module):
+    """
+    Embed scalar time (normalized) -> d_model, per time step.
+    """
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(1, d_model),
+            nn.SiLU(),
+            nn.Linear(d_model, d_model),
+        )
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        # t: (..., 1) float32
+        return self.net(t)
 
 
-def poisson_log_likelihood(masked_log_lambdas, masked_data, indices, int_lambdas):
-    n_data_points = masked_data.size()[-1]
-    if n_data_points > 0:
-        log_prob = torch.sum(masked_log_lambdas) - int_lambdas[indices]
-    else:
-        log_prob = torch.zeros([1]).to(get_device(masked_data)).squeeze()
-    return log_prob
+class istsplm_forecast(nn.Module):
+    """
+    ISTS forecasting with Qwen2.5 (time-level + variable-level).
+    Improvements vs earlier:
+      - Normalize continuous timestamps, add learnable time scale for CT-RoPE.
+      - Time-aware forecasting head using tp_to_predict (no more constant expansion).
+      - Pure float32 pipeline for stability.
+    """
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+        self.device = args.device
+        self.d_model = args.d_model
+        self.num_types = args.num_types
+        self.prompt_len = args.prompt_len
+        self.use_lora = args.use_lora
+        self.plm_name = args.plm_path
+        self.n_plm_layers = 2  # 0: time-level, 1: variable-level
 
+        # Embeddings
+        self.value_emb = ValueEmbeddingQwen(1, self.d_model)
+        self.var_emb = nn.Embedding(self.num_types, self.d_model)
+        self.prompt_embed = nn.Parameter(torch.randn(1, self.prompt_len, self.d_model))
 
-def compute_binary_CE_loss(label_predictions, mortality_label):
-    mortality_label = mortality_label.reshape(-1)
+        # Time scaling for CT-RoPE (learnable)
+        self.time_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
 
-    if len(label_predictions.size()) == 1:
-        label_predictions = label_predictions.unsqueeze(0)
+        # Time-aware head: embed future times and fuse with pooled rep
+        self.future_time_embed = TimeMLP(self.d_model)
+        # Predict per variable per time: take fused (B, L_pred, D, H) -> scalar per variable
+        self.var_readout = nn.Linear(self.d_model, 1)
 
-    n_traj_samples = label_predictions.size(0)
-    label_predictions = label_predictions.reshape(n_traj_samples, -1)
+        # Load Qwen2.5 in float32
+        self.config = AutoConfig.from_pretrained(self.plm_name, trust_remote_code=True)
+        self.config.use_cache = False
 
-    idx_not_nan = ~torch.isnan(mortality_label)
-    if len(idx_not_nan) == 0.:
-        print("All labels are NaNs!")
-        ce_loss = torch.Tensor(0.).to(get_device(mortality_label))
+        gpts = []
+        for _ in range(self.n_plm_layers):
+            base = AutoModelForCausalLM.from_pretrained(
+                self.plm_name,
+                trust_remote_code=True,
+                torch_dtype=torch.float32
+            )
+            core = getattr(base, "model", base)
+            core = self._inject_ctr_rope(core, verbose=False)
+            if self.use_lora:
+                core = self._apply_lora(self.args, core)
+            gpts.append(core)
 
-    label_predictions = label_predictions[:, idx_not_nan]
-    mortality_label = mortality_label[idx_not_nan]
+        self.gpts = nn.ModuleList(gpts)
 
-    if torch.sum(mortality_label == 0.) == 0 or torch.sum(mortality_label == 1.) == 0:
-        print("Warning: batch has single class. Increase batch size.")
+        # Projection head (post time-PLM pooling)
+        self.ln_proj = nn.LayerNorm(self.d_model)
 
-    assert (not torch.isnan(label_predictions).any())
-    assert (not torch.isnan(mortality_label).any())
+        # Retain old head for ablations (unused by default)
+        self.forecasting_head = nn.Sequential(
+            nn.Linear(self.d_model, self.d_model // 2),
+            nn.LeakyReLU(),
+            nn.Linear(self.d_model // 2, self.num_types)
+        )
 
-    mortality_label = mortality_label.repeat(n_traj_samples, 1)
-    ce_loss = nn.BCEWithLogitsLoss()(label_predictions, mortality_label)
-    ce_loss = ce_loss / n_traj_samples
-    return ce_loss
+    # ---------------- LoRA ----------------
+    def _apply_lora(self, args, core_model):
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+        lora_cfg = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            target_modules=target_modules,
+            lora_dropout=args.lora_dropout,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM
+        )
+        core_model = get_peft_model(core_model, lora_cfg)
+        for n, p in core_model.named_parameters():
+            if "lora" not in n:
+                p.requires_grad = False
+        return core_model
 
+    # ---------------- CT-RoPE Injection ----------------
+    def _inject_ctr_rope(self, core_model, verbose: bool = True):
+        if not hasattr(core_model, "layers"):
+            raise ValueError("Qwen2.5 core model has no 'layers' attribute.")
+        layers = core_model.layers
 
-def compute_multiclass_CE_loss(label_predictions, true_label, mask):
-    if (len(label_predictions.size()) == 3):
-        label_predictions = label_predictions.unsqueeze(0)
+        try:
+            from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
+        except Exception:
+            raise RuntimeError("Failed to import apply_rotary_pos_emb. Upgrade transformers for Qwen2.5 support.")
 
-    n_traj_samples, n_traj, n_tp, n_dims = label_predictions.size()
+        def wrap(old_attn):
+            q_proj = getattr(old_attn, "q_proj", None)
+            k_proj = getattr(old_attn, "k_proj", None)
+            v_proj = getattr(old_attn, "v_proj", None)
+            o_proj = getattr(old_attn, "o_proj", None)
+            if any(x is None for x in [q_proj, k_proj, v_proj, o_proj]):
+                raise ValueError("Attention layer missing q_proj/k_proj/v_proj/o_proj")
 
-    true_label = true_label.repeat(n_traj_samples, 1, 1)
+            cfg = getattr(old_attn, "config", None)
+            num_heads = getattr(old_attn, "num_heads", None) or getattr(cfg, "num_attention_heads", None)
+            num_kv = getattr(old_attn, "num_key_value_heads", None) or getattr(cfg, "num_key_value_heads", num_heads)
+            hidden_size = getattr(cfg, "hidden_size", q_proj.in_features)
+            head_dim = hidden_size // num_heads
+            rotary_emb = getattr(old_attn, "rotary_emb", None)
+            attn_dropout = getattr(old_attn, "attn_dropout", nn.Dropout(0.0))
 
-    label_predictions = label_predictions.reshape(n_traj_samples * n_traj * n_tp, n_dims)
-    true_label = true_label.reshape(n_traj_samples * n_traj * n_tp, n_dims)
+            def repeat_kv(kv: torch.Tensor, n_rep: int) -> torch.Tensor:
+                if n_rep == 1:
+                    return kv
+                bsz, kv_heads, seqlen, hd = kv.shape
+                return kv.unsqueeze(2).expand(bsz, kv_heads, n_rep, seqlen, hd).reshape(
+                    bsz, kv_heads * n_rep, seqlen, hd
+                )
 
-    mask = torch.sum(mask, -1) > 0
+            def new_forward(
+                hidden_states: torch.Tensor,
+                attention_mask: Optional[torch.Tensor] = None,
+                position_ids: Optional[torch.LongTensor] = None,
+                past_key_value: Optional[Tuple[torch.Tensor]] = None,
+                output_attentions: bool = False,
+                use_cache: bool = False,
+                timestamps: Optional[torch.Tensor] = None,
+                cache_position: Optional[torch.LongTensor] = None,
+                **kwargs,
+            ):
+                hidden_states = hidden_states.float()
 
-    pred_mask = mask.repeat(n_dims, 1, 1).permute(1, 2, 0)
-    label_mask = mask
-    pred_mask = pred_mask.repeat(n_traj_samples, 1, 1, 1)
-    label_mask = label_mask.repeat(n_traj_samples, 1, 1, 1)
+                bsz, q_len, _ = hidden_states.shape
+                q = q_proj(hidden_states)
+                k = k_proj(hidden_states)
+                v = v_proj(hidden_states)
 
-    pred_mask = pred_mask.reshape(n_traj_samples * n_traj * n_tp, n_dims)
-    label_mask = label_mask.reshape(n_traj_samples * n_traj * n_tp, 1)
+                q = q.view(bsz, q_len, num_heads, head_dim).transpose(1, 2)
+                k = k.view(bsz, q_len, num_kv, head_dim).transpose(1, 2)
+                v = v.view(bsz, q_len, num_kv, head_dim).transpose(1, 2)
 
-    if (label_predictions.size(-1) > 1) and (true_label.size(-1) > 1):
-        assert (label_predictions.size(-1) == true_label.size(-1))
-        _, true_label = true_label.max(-1)
+                kv_seq_len = k.shape[-2]
+                if past_key_value is not None:
+                    kv_seq_len += past_key_value[0].shape[-2]
 
-    res = []
-    for i in range(true_label.size(0)):
-        pred_masked = torch.masked_select(label_predictions[i], pred_mask[i].bool())
-        labels = torch.masked_select(true_label[i], label_mask[i].bool())
-        pred_masked = pred_masked.reshape(-1, n_dims)
-        if (len(labels) == 0):
-            continue
-        ce_loss = nn.CrossEntropyLoss()(pred_masked, labels.long())
-        res.append(ce_loss)
+                # CT-RoPE with normalized continuous timestamps and learnable scale
+                if rotary_emb is not None and timestamps is not None:
+                    # timestamps: (B*D, L_total) -> normalize per sequence [0,1]
+                    tmin = timestamps.min(dim=-1, keepdim=True).values
+                    tmax = timestamps.max(dim=-1, keepdim=True).values
+                    tptp = torch.clamp(tmax - tmin, min=1e-8)
+                    t_norm = (timestamps - tmin) / tptp
+                    t_scaled = t_norm * self.time_scale  # learnable scale
 
-    ce_loss = torch.stack(res, 0).to(get_device(label_predictions))
-    ce_loss = torch.mean(ce_loss)
-    return ce_loss
+                    cos, sin = rotary_emb(v, seq_len=kv_seq_len)
+                    ts = t_scaled.unsqueeze(1).unsqueeze(-1).to(k.dtype)
+                    q, k = apply_rotary_pos_emb(q, k, cos, sin, ts)
+                elif rotary_emb is not None and position_ids is not None:
+                    cos, sin = rotary_emb(v, seq_len=kv_seq_len)
+                    q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
 
+                if past_key_value is not None:
+                    k = torch.cat([past_key_value[0], k], dim=2)
+                    v = torch.cat([past_key_value[1], v], dim=2)
 
-def compute_masked_likelihood(mu, data, mask, likelihood_func):
-    n_traj_samples, n_traj, n_timepoints, n_dims = data.size()
-    res = []
-    for i in range(n_traj_samples):
-        for k in range(n_traj):
-            for j in range(n_dims):
-                data_masked = torch.masked_select(data[i, k, :, j], mask[i, k, :, j].bool())
-                mu_masked = torch.masked_select(mu[i, k, :, j], mask[i, k, :, j].bool())
-                log_prob = likelihood_func(mu_masked, data_masked, indices=(i, k, j))
-                res.append(log_prob)
-    res = torch.stack(res, 0).to(get_device(data))
-    res = res.reshape((n_traj_samples, n_traj, n_dims))
-    res = torch.mean(res, -1)
-    res = res.transpose(0, 1)
-    return res
+                if num_kv != num_heads:
+                    k = repeat_kv(k, num_heads // num_kv)
+                    v = repeat_kv(v, num_heads // num_kv)
 
+                past = (k, v) if use_cache else None
 
-def masked_gaussian_log_density(mu, data, obsrv_std, mask=None):
-    if (len(mu.size()) == 3):
-        mu = mu.unsqueeze(0)
-    if (len(data.size()) == 2):
-        data = data.unsqueeze(0).unsqueeze(2)
-    elif (len(data.size()) == 3):
-        data = data.unsqueeze(0)
+                attn_scores = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(head_dim)
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(attn_scores.dtype)
+                    if cache_position is not None:
+                        mask_q_len = attention_mask.shape[-2]
+                        if mask_q_len != q_len:
+                            start_row = mask_q_len - q_len
+                            attention_mask = attention_mask[:, :, start_row:, :]
+                    attn_scores = attn_scores + attention_mask
 
-    n_traj_samples, n_traj, n_timepoints, n_dims = mu.size()
-    assert (data.size()[-1] == n_dims)
+                attn_weights = nn.functional.softmax(attn_scores, dim=-1)
+                attn_weights = attn_dropout(attn_weights)
+                attn_output = torch.matmul(attn_weights, v)
 
-    if mask is None:
-        mu_flat = mu.reshape(n_traj_samples * n_traj, n_timepoints * n_dims)
-        n_traj_samples, n_traj, n_timepoints, n_dims = data.size()
-        data_flat = data.reshape(n_traj_samples * n_traj, n_timepoints * n_dims)
-        res = gaussian_log_likelihood(mu_flat, data_flat, obsrv_std)
-        res = res.reshape(n_traj_samples, n_traj).transpose(0, 1)
-    else:
-        func = lambda mu_, data_, indices: gaussian_log_likelihood(mu_, data_, obsrv_std=obsrv_std, indices=indices)
-        res = compute_masked_likelihood(mu, data, mask, func)
-    return res
+                if attn_output.shape != (bsz, num_heads, q_len, head_dim):
+                    raise ValueError(f"attn_output shape mismatch {attn_output.shape}")
 
+                attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, num_heads * head_dim)
+                attn_output = o_proj(attn_output)
 
-def mse(mu, data, indices=None):
-    n_data_points = mu.size()[-1]
-    if n_data_points > 0:
-        mse_val = nn.MSELoss()(mu, data)
-    else:
-        mse_val = torch.zeros([1]).to(get_device(data)).squeeze()
-    return mse_val
+                attn_ret = attn_weights if output_attentions else None
+                if use_cache:
+                    return attn_output, attn_ret, past
+                else:
+                    return attn_output, attn_ret
 
+            return new_forward
 
-def compute_mse(mu, data, mask=None):
-    if (len(mu.size()) == 3):
-        mu = mu.unsqueeze(0)
-    if (len(data.size()) == 2):
-        data = data.unsqueeze(0).unsqueeze(2)
-    elif (len(data.size()) == 3):
-        data = data.unsqueeze(0)
+        for i, layer in enumerate(layers):
+            if hasattr(layer, "self_attn"):
+                layer.self_attn.forward = wrap(layer.self_attn)
+                if verbose:
+                    print(f"[CT-RoPE] Patched layer {i} attention: {type(layer.self_attn)}")
+        return core_model
 
-    n_traj_samples, n_traj, n_timepoints, n_dims = mu.size()
-    assert (data.size()[-1] == n_dims)
+    # ---------------- Forecasting ----------------
+    def forecasting(self, batch_dict, n_vars_to_predict=None):
+        # Move to device and fp32
+        observed_data = batch_dict["observed_data"].to(self.device).float()    # (B, L_obs, D)
+        observed_mask = batch_dict["observed_mask"].to(self.device).float()    # (B, L_obs, D)
+        observed_tp_raw = batch_dict["observed_tp"].to(self.device).float()    # (B, L_obs) or (B, 1, L_obs)
+        tp_to_predict = batch_dict["tp_to_predict"].to(self.device).float()    # (B, L_pred)
 
-    if mask is None:
-        mu_flat = mu.reshape(n_traj_samples * n_traj, n_timepoints * n_dims)
-        n_traj_samples, n_traj, n_timepoints, n_dims = data.size()
-        data_flat = data.reshape(n_traj_samples * n_traj, n_timepoints * n_dims)
-        res = mse(mu_flat, data_flat)
-    else:
-        res = compute_masked_likelihood(mu, data, mask, mse)
-    return res
+        B, L_obs, D = observed_data.shape
+        L_pred = tp_to_predict.shape[1]
 
+        # 1) Time-level
+        x_flat = observed_data.permute(0, 2, 1).reshape(B * D, L_obs, 1).float()
+        value_embed = self.value_emb(x_flat)  # (B*D, L_obs, H)
+        L_val = value_embed.size(1)
 
-def compute_poisson_proc_likelihood(truth, pred_y, info, mask=None):
-    if mask is None:
-        poisson_log_l = torch.sum(info["log_lambda_y"], 2) - info["int_lambda"]
-        poisson_log_l = torch.mean(poisson_log_l, -1)
-    else:
-        truth_repeated = truth.repeat(pred_y.size(0), 1, 1, 1)
-        mask_repeated = mask.repeat(pred_y.size(0), 1, 1, 1)
-        int_lambda = info["int_lambda"]
-        f = lambda log_lam, data, indices: poisson_log_likelihood(log_lam, data, indices, int_lambda)
-        poisson_log_l = compute_masked_likelihood(info["log_lambda_y"], truth_repeated, mask_repeated, f)
-        poisson_log_l = poisson_log_l.permute(1, 0)
-    return poisson_log_l
-
-
-def compute_error(truth, pred_y, mask, func, reduce, norm_dict=None):
-    if len(pred_y.shape) == 3:
-        pred_y = pred_y.unsqueeze(dim=0)
-
-    n_traj_samples, n_batch, n_tp, n_dim = pred_y.size()
-    truth_repeated = truth.repeat(pred_y.size(0), 1, 1, 1)
-    mask = mask.repeat(pred_y.size(0), 1, 1, 1)
-
-    if (func == "MSE"):
-        error = ((truth_repeated - pred_y) ** 2) * mask
-    elif (func == "MAE"):
-        error = torch.abs(truth_repeated - pred_y) * mask
-    elif (func == "MAPE"):
-        if norm_dict is None:
-            mask = (truth_repeated != 0) * mask
-            truth_div = truth_repeated + (truth_repeated == 0) * 1e-8
-            error = torch.abs(truth_repeated - pred_y) / truth_div * mask
+        observed_tp = observed_tp_raw.reshape(B, -1)
+        L_time = observed_tp.size(1)
+        if L_time != L_val:
+            if L_time >= L_val:
+                tp_aligned = observed_tp[:, -L_val:]
+            else:
+                pad = torch.zeros(B, L_val - L_time, device=self.device)
+                tp_aligned = torch.cat([observed_tp, pad], dim=1)
         else:
-            data_max = norm_dict["data_max"]
-            data_min = norm_dict["data_min"]
-            truth_rescale = truth_repeated * (data_max - data_min) + data_min
-            pred_y_rescale = pred_y * (data_max - data_min) + data_min
-            mask = (truth_rescale != 0) * mask
-            truth_rescale_div = truth_rescale + (truth_rescale == 0) * 1e-8
-            error = torch.abs(truth_rescale - pred_y_rescale) / truth_rescale_div * mask
-    elif (func == "HUBER"):
-        delta = 2
-        abs_error = torch.abs(truth_repeated - pred_y)
-        quadratic = torch.min(abs_error, torch.tensor(delta))
-        linear = abs_error - quadratic
-        error = 0.5 * quadratic ** 2 + delta * linear
-        error = error * mask
-    else:
-        raise Exception("Error function not specified")
+            tp_aligned = observed_tp
 
-    error_var_sum = error.reshape(-1, n_dim).sum(dim=0)
-    mask_count = mask.reshape(-1, n_dim).sum(dim=0)
+        tt = tp_aligned.unsqueeze(1).expand(B, D, L_val).reshape(B * D, L_val)
 
-    if (reduce == "mean"):
-        error_var_avg = error_var_sum / (mask_count + 1e-8)
-        n_avai_var = torch.count_nonzero(mask_count)
-        error_avg = error_var_avg.sum() / n_avai_var
-        return error_avg
-    elif (reduce == "sum"):
-        return error_var_sum, mask_count
-    else:
-        raise Exception("Reduce argument not specified!")
+        prompt = self.prompt_embed.expand(B * D, -1, -1).float()
+        inputs_embeds = torch.cat([prompt, value_embed], dim=1)  # (B*D, prompt+L_val, H)
 
+        # For CT-RoPE: prepend prompt times (zeros) then normalize+scale inside attention
+        tt_prompt = torch.zeros(B * D, self.prompt_len, device=self.device)
+        tt_with_prompt = torch.cat([tt_prompt, tt], dim=1)
 
-# ---------------- All Losses (Forecasting) ----------------
-def compute_all_losses(model, batch_dict, dataset=None):
-    """
-    Batch dict will be moved to model device before computation.
-    Returns dict with loss, mse, rmse, mae.
-    """
-    device = next(model.parameters()).device
-    batch_dict = to_device_batch(batch_dict, device)
+        time_mask_flat = observed_mask.permute(0, 2, 1).reshape(B * D, L_obs)
+        if L_obs != L_val:
+            if L_obs >= L_val:
+                time_mask_flat = time_mask_flat[:, -L_val:]
+            else:
+                padm = torch.zeros(B * D, L_val - L_obs, device=self.device)
+                time_mask_flat = torch.cat([time_mask_flat, padm], dim=1)
 
-    pred_y = model.forecasting(batch_dict, n_vars_to_predict=None)
+        time_mask_prompt = torch.ones(B * D, self.prompt_len, device=self.device)
+        time_mask = torch.cat([time_mask_prompt, time_mask_flat], dim=1)  # (B*D, total_len)
+        additive_mask = (1.0 - time_mask) * torch.finfo(torch.float32).min
+        additive_mask = additive_mask.unsqueeze(1).unsqueeze(1)  # (B*D,1,1,total_len)
 
-    mse_val = compute_error(batch_dict["data_to_predict"], pred_y,
-                            mask=batch_dict["mask_predicted_data"],
-                            func="MSE", reduce="mean")
-    rmse_val = torch.sqrt(mse_val)
-    mae_val = compute_error(batch_dict["data_to_predict"], pred_y,
-                            mask=batch_dict["mask_predicted_data"],
-                            func="MAE", reduce="mean")
+        out_time = self.gpts[0](
+            inputs_embeds=inputs_embeds,
+            attention_mask=additive_mask,
+            timestamps=tt_with_prompt,
+            use_cache=False,
+            output_attentions=False
+        ).last_hidden_state  # (B*D, total_len, H)
 
-    loss = mse_val
-    if dataset == 'ushcn':
-        loss = compute_error(batch_dict["data_to_predict"], pred_y,
-                             mask=batch_dict["mask_predicted_data"],
-                             func="HUBER", reduce="mean")
+        # Masked pooling over observed tokens (drop prompt)
+        mask_pool = observed_mask.permute(0, 2, 1).reshape(B * D, L_obs, 1)
+        if L_obs != L_val:
+            if L_obs >= L_val:
+                mask_pool = mask_pool[:, -L_val:, :]
+            else:
+                padm2 = torch.zeros(B * D, L_val - L_obs, 1, device=self.device)
+                mask_pool = torch.cat([mask_pool, padm2], dim=1)
 
-    results = {
-        "loss": loss,
-        "mse": mse_val.item(),
-        "rmse": rmse_val.item(),
-        "mae": mae_val.item()
-    }
-    return results
+        out_val = out_time[:, self.prompt_len:]  # (B*D, L_val, H)
+        denom = mask_pool.sum(dim=1, keepdim=True) + 1e-8
+        pooled = (out_val * mask_pool).sum(dim=1) / denom.squeeze(1)  # (B*D, H)
+        pooled = self.ln_proj(pooled).view(B, D, -1)  # (B, D, H)
 
+        # 2) Variable-level
+        var_emb = self.var_emb.weight.unsqueeze(0).expand(B, D, -1).float()
+        var_inputs = pooled + var_emb
+        var_attn_mask = torch.zeros(B, D, D, device=self.device).unsqueeze(1)
+        position_ids = torch.arange(D, device=self.device).unsqueeze(0).expand(B, D)
 
-def evaluation(model, dataloader, n_batches):
-    """
-    Aggregate metrics over validation/test sets.
-    """
-    device = next(model.parameters()).device
-    n_eval_samples = 0
-    n_eval_samples_mape = 0
-    total_results = {
-        "loss": 0,
-        "mse": 0,
-        "mae": 0,
-        "rmse": 0,
-        "mape": 0
-    }
+        out_var = self.gpts[1](
+            inputs_embeds=var_inputs,
+            attention_mask=var_attn_mask,
+            position_ids=position_ids,
+            use_cache=False,
+            output_attentions=False
+        ).last_hidden_state  # (B, D, H)
 
-    for _ in range(n_batches):
-        batch_dict = utils.get_next_batch(dataloader)
-        batch_dict = to_device_batch(batch_dict, device)
+        # 3) Time-aware forecasting head using tp_to_predict
+        # Normalize future times using observed min/max (per batch)
+        tmin_obs = observed_tp.min(dim=1, keepdim=True).values  # (B,1)
+        tmax_obs = observed_tp.max(dim=1, keepdim=True).values  # (B,1)
+        tptp_obs = torch.clamp(tmax_obs - tmin_obs, min=1e-8)
+        tpred_norm = torch.clamp((tp_to_predict - tmin_obs) / tptp_obs, 0.0, 1.0)  # (B, L_pred)
 
-        pred_y = model.forecasting(batch_dict, n_vars_to_predict=None)
+        # Embed future times to H: (B,L_pred,1)->(B,L_pred,H)
+        tpred_H = self.future_time_embed(tpred_norm.unsqueeze(-1))  # (B, L_pred, H)
 
-        se_var_sum, mask_count = compute_error(batch_dict["data_to_predict"], pred_y,
-                                               mask=batch_dict["mask_predicted_data"],
-                                               func="MSE", reduce="sum")
-        ae_var_sum, _ = compute_error(batch_dict["data_to_predict"], pred_y,
-                                      mask=batch_dict["mask_predicted_data"],
-                                      func="MAE", reduce="sum")
-        ape_var_sum, mask_count_mape = compute_error(batch_dict["data_to_predict"], pred_y,
-                                                     mask=batch_dict["mask_predicted_data"],
-                                                     func="MAPE", reduce="sum")
+        # Fuse: broadcast add with variable reps (B,D,H)
+        fused = out_var.unsqueeze(1) + tpred_H.unsqueeze(2)  # (B, L_pred, D, H)
 
-        total_results["loss"] += se_var_sum
-        total_results["mse"] += se_var_sum
-        total_results["mae"] += ae_var_sum
-        total_results["mape"] += ape_var_sum
-        n_eval_samples += mask_count
-        n_eval_samples_mape += mask_count_mape
+        # Readout per variable to scalar
+        pred = self.var_readout(fused).squeeze(-1)  # (B, L_pred, D)
 
-    n_avai_var = torch.count_nonzero(n_eval_samples)
-    n_avai_var_mape = torch.count_nonzero(n_eval_samples_mape)
+        # Optional: if you want old constant head, uncomment:
+        # regression_value = self.forecasting_head(out_var)[:, :, 0]  # (B, D)
+        # pred_const = regression_value.unsqueeze(1).expand(-1, L_pred, -1)
 
-    total_results["loss"] = (total_results["loss"] / (n_eval_samples + 1e-8)).sum() / n_avai_var
-    total_results["mse"] = (total_results["mse"] / (n_eval_samples + 1e-8)).sum() / n_avai_var
-    total_results["mae"] = (total_results["mae"] / (n_eval_samples + 1e-8)).sum() / n_avai_var
-    total_results["rmse"] = torch.sqrt(total_results["mse"])
-    total_results["mape"] = (total_results["mape"] / (n_eval_samples_mape + 1e-8)).sum() / n_avai_var_mape
+        if n_vars_to_predict is not None:
+            pred = pred[:, :, :n_vars_to_predict]
 
-    # Convert tensors to plain floats
-    for key, var in total_results.items():
-        if isinstance(var, torch.Tensor):
-            total_results[key] = var.item()
+        return pred.float()
 
-    return total_results
+    def forward(self, batch_dict, n_vars_to_predict=None):
+        return self.forecasting(batch_dict, n_vars_to_predict)

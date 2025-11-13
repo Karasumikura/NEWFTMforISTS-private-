@@ -70,31 +70,53 @@ class CTRoPERotaryEmbedding(nn.Module):
 
 # ==================================================================================
 # 第 4 部分：自定义 Qwen 架构 (以支持 CT-RoPE)
-# (!!!) 使用健壮的继承方式重构 (!!!)
+# (!!!) 回退到“脆弱但明确”的模式 (!!!)
 # ==================================================================================
 
 class CustomQwen2Attention(Qwen2Attention):
     """
-    (健壮版) 修改后的 Qwen2Attention
+    (回退到明确模式) 修改后的 Qwen2Attention
     """
+    
     def __init__(self, config: Qwen2Config, layer_idx: Optional[int] = None):
         
-        # 1. (!!!) 解决方案：调用完整的父类 __init__
-        # 这会正确设置 self.num_heads, self.head_dim, self.q_proj, 
-        # self._repeat_kv, self.attention_bias 等所有属性和方法。
-        super().__init__(config, layer_idx)
+        # 1. (!!!) 解决方案：回退到“脆弱但明确”的模式
+        # 仅调用 nn.Module 的 __init__
+        super(Qwen2Attention, self).__init__() 
         
-        # 2. (!!!) 覆盖：现在只替换我们需要更改的部分
-        # 我们用自定义的 CT-RoPE 替换标准的 rotary_emb
+        # 2. (!!!) 手动复制 Qwen2Attention 的所有属性
+        self.config = config
+        self.layer_idx = layer_idx
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.max_position_embeddings = config.max_position_embeddings
+        self.rope_theta = config.rope_theta
+        self.attention_dropout = config.attention_dropout
+        
+        # 3. (!!!) 手动定义线性层，并修复 'attention_bias'
+        bias_value = getattr(config, 'attention_bias', True) 
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=bias_value)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=bias_value)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=bias_value)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=bias_value)
+
+        # 4. (!!!) 用你的自定义 RoPE 替换
         self.rotary_emb = CTRoPERotaryEmbedding(
-            self.head_dim, 
-            config.max_position_embeddings, 
-            config.rope_theta,
+            self.head_dim, config.max_position_embeddings, config.rope_theta,
         )
-        # (不再需要手动复制 self.num_heads, self.q_proj, ... 等)
+
+    # 5. (!!!) 必须手动复制 _repeat_kv 方法
+    def _repeat_kv(self, hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+        batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+        if n_rep == 1:
+            return hidden_states
+        hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+        return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
     def forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, output_attentions=False, use_cache=False, **kwargs):
-        # (!!!) forward 方法保持不变，它现在可以安全地调用 self._repeat_kv (!!!)
         if "timestamps" not in kwargs:
             raise ValueError("CustomQwen2Attention 必须接收 'timestamps' 参数")
         timestamps = kwargs["timestamps"]
@@ -122,11 +144,9 @@ class CustomQwen2Attention(Qwen2Attention):
             
         past_key_value = (key_states, value_states) if use_cache else None
         
-        # (!!!) self._repeat_kv 现在可以被正确找到 (!!!)
         key_states = self._repeat_kv(key_states, self.num_key_value_groups)
         value_states = self._repeat_kv(value_states, self.num_key_value_groups)
         
-        # 注意力逻辑 (Flash 或 SDPA)
         if hasattr(self, '_use_flash_attention_2') and self._use_flash_attention_2:
             attn_output = self._flash_attention_forward(query_states, key_states, value_states, attention_mask, q_len, dropout=self.attention_dropout)
         elif hasattr(self, '_sdpa_attention_forward'):
@@ -150,24 +170,21 @@ class CustomQwen2Attention(Qwen2Attention):
 
 class CustomQwen2DecoderLayer(Qwen2DecoderLayer):
     """
-    (健壮版) 修改后的 Qwen2DecoderLayer
+    (回退到明确模式) 修改后的 Qwen2DecoderLayer
     """
     def __init__(self, config: Qwen2Config, layer_idx: int):
         
-        # 1. (!!!) 解决方案：调用完整的父类 __init__
-        # 这会创建标准的 self.self_attn, self.mlp, self.input_layernorm
-        super().__init__(config, layer_idx)
+        # 1. (!!!) 解决方案：回退
+        super(Qwen2DecoderLayer, self).__init__()
         
-        # 2. (!!!) 覆盖：用我们的 CustomQwen2Attention 替换
-        self.self_attn = CustomQwen2Attention(config, layer_idx)
-        
-        # 3. (!!!) 确保：保持使用 Qwen2RMSNorm (父类 __init__ 应该已经做了，但为了安全)
+        # 2. (!!!) 手动定义所有组件
+        self.hidden_size = config.hidden_size
+        self.self_attn = CustomQwen2Attention(config, layer_idx) # <--- 使用我们的自定义 Attention
+        self.mlp = Qwen2MLP(config)
         self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
     
     def forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_value=None, output_attentions=False, use_cache=False, **kwargs):
-        # (!!!) forward 方法保持不变，它现在会将 'timestamps' 传递给我们
-        # (!!!) 自定义的 self.self_attn
         timestamps = kwargs.get("timestamps")
         if timestamps is None:
             raise ValueError("CustomQwen2DecoderLayer 必须接收 'timestamps' 参数")
@@ -178,7 +195,7 @@ class CustomQwen2DecoderLayer(Qwen2DecoderLayer):
         attn_outputs, attn_weights, present_key_value = self.self_attn(
             hidden_states=hidden_states, attention_mask=attention_mask, position_ids=None,
             past_key_value=past_key_value, output_attentions=output_attentions, use_cache=use_cache,
-            timestamps=timestamps, # <-- 传递 timestamps
+            timestamps=timestamps, 
         )
         
         hidden_states = residual + attn_outputs
@@ -196,28 +213,29 @@ class CustomQwen2DecoderLayer(Qwen2DecoderLayer):
 
 class CustomQwen2Model(Qwen2Model):
     """
-    (健壮版) 修改后的 Qwen2Model
+    (回退到明确模式) 修改后的 Qwen2Model
     """
     def __init__(self, config: Qwen2Config):
         
-        # 1. (!!!) 解决方案：调用完整的父类 __init__
-        # 这会创建标准的 self.layers 和 self.norm
-        super().__init__(config)
+        # 1. (!!!) 解决方案：回退
+        super(Qwen2Model, self).__init__(config)
         
-        # 2. (!!!) 覆盖：用 CustomQwen2DecoderLayer 列表替换 self.layers
+        # 2. (!!!) 手动定义所有组件
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        
+        # 3. (!!!) 使用我们的自定义 Layer 列表
         self.layers = nn.ModuleList(
             [CustomQwen2DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         
-        # 3. (!!!) 确保：保持使用 Qwen2RMSNorm
+        # 4. (!!!) 使用 Qwen2RMSNorm
         self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         
-        # 4. (!!!) 仍然需要调用 post_init()
         self.post_init()
     
     def forward(self, input_ids=None, attention_mask=None, position_ids=None, past_key_values=None, inputs_embeds=None, use_cache=None, output_attentions=None, output_hidden_states=None, return_dict=None, timestamps=None):
-        # (!!!) forward 方法保持不变，它现在会将 'timestamps' 传递给我们
-        # (!!!) 自定义的 self.layers
         if timestamps is None:
             raise ValueError("CustomQwen2Model 必须接收 'timestamps' 参数")
         
@@ -250,7 +268,7 @@ class CustomQwen2Model(Qwen2Model):
                 past_key_value=past_key_value, 
                 output_attentions=output_attentions, 
                 use_cache=use_cache,
-                timestamps=timestamps, # <-- 传递 timestamps
+                timestamps=timestamps, 
             )
             hidden_states = layer_outputs[0]
             if use_cache:

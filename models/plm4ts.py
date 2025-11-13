@@ -34,7 +34,8 @@ class ValueEmbedding_Qwen(nn.Module):
     """将 (值, 掩码) 对投影到 d_model"""
     def __init__(self, c_in, d_model):
         super(ValueEmbedding_Qwen, self).__init__()
-        self.projection = nn.Linear(c_in, d_model)
+        # c_in 在这里是 1，因为每个变量的值都被单独处理
+        self.projection = nn.Linear(c_in, d_model) 
     def forward(self, x):
         return self.projection(x)
 
@@ -91,28 +92,23 @@ class CTRoPEQwen2Attention(Qwen2Attention):
         # CT-RoPE 应用: 使用连续时间戳 (timestamps) 而不是 position_ids
         if timestamps is not None:
             # timestamps: (B, L)
-            # CT-RoPE 假设 RoPE 的旋转角是基于时间差的。
-            # 我们将 timestamps 视为一个连续的、归一化后的位置索引
+            # 使用 timestamps 作为位置索引进行旋转
             
-            # 使用 timestamps 作为新的 position_ids 进行旋转
             cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
             
-            # 使用 timestamps 来计算旋转角度。这里简化处理，将 timestamps (B, L) 
-            # 扩展到 (B, 1, L, 1) 作为位置索引
+            # 扩展 timestamps 以匹配 RoPE 接口所需的形状 (B, 1, L, 1)
             timestamps_exp = timestamps.unsqueeze(1).unsqueeze(-1).to(key_states.dtype)
             
             query_states, key_states = apply_rotary_pos_emb(
                 query_states, key_states, cos, sin, timestamps_exp
             )
         elif position_ids is not None:
-            # Fallback to standard RoPE if no timestamps (e.g., in variable PLM)
+            # Fallback to standard RoPE
             cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
             query_states, key_states = apply_rotary_pos_emb(
                 query_states, key_states, cos, sin, position_ids
             )
-        # else: 如果两者都没有，则不应用旋转 (通常不发生)
-
-
+        
         if past_key_value is not None:
             # reuse k, v, self_attention
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
@@ -124,19 +120,14 @@ class CTRoPEQwen2Attention(Qwen2Attention):
 
         # [FIX 2: RuntimeError] 修复 use_cache=True (预测阶段) 时的 attention mask 切片问题
         if attention_mask is not None:
-            # attention_mask shape is (B, 1, L_kv, L_kv) or (B, 1, 1, L_kv) for generation
-            # attn_weights shape is (B, H, q_len, kv_len)
-            
             if cache_position is not None:
-                # 在生成阶段，q_len 较小 (通常为 1 或 2)，kv_len 较大。
-                # attention_mask 必须与 query_states 的 q_len 匹配。
-                attention_mask_q_len = attention_mask.shape[-2]
-                if q_len != attention_mask_q_len:
-                    # 对于 Qwen2，attention_mask 通常是 (B, 1, kv_len, kv_len)
-                    # 我们只需要 mask 矩阵中的最后 q_len 行
-                    
-                    # 确定需要保留的行范围
-                    start_row = attention_mask_q_len - q_len
+                # attention_mask shape is typically (B, 1, L_kv, L_kv). 
+                # We need to slice the L_kv rows corresponding to q_len (q_len is small in generation).
+                attention_mask_kv_len = attention_mask.shape[-2]
+                if q_len != attention_mask_kv_len:
+                    # 获取需要保留的行的起始索引
+                    start_row = attention_mask_kv_len - q_len
+                    # 仅保留 attention_mask 中对应 q_len 的行
                     attention_mask = attention_mask[:, :, start_row:, :]
 
             attn_weights = attn_weights + attention_mask
@@ -170,11 +161,9 @@ class Qwen2DecoderLayerWithCTRoPE(Qwen2DecoderLayer):
         super().__init__(config, layer_idx)
         # 用我们的 CTRoPE 版本替换标准 Qwen2Attention
         self.self_attn = CTRoPEQwen2Attention(config, layer_idx)
-        # MLP 和 LayerNorm 保持不变
 
 
     # [FIX 1: SyntaxError] 修复了 Qwen2DecoderLayerWithCTRoPE.forward 中的语法错误
-    # Qwen2 的 forward 签名通常很复杂，需要确保所有参数都被接收。
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -185,7 +174,6 @@ class Qwen2DecoderLayerWithCTRoPE(Qwen2DecoderLayer):
         use_cache: Optional[bool] = False,
         timestamps: Optional[torch.Tensor] = None, # <-- 接收连续时间戳
         cache_position: Optional[torch.LongTensor] = None,
-        **kwargs, # 接收所有额外参数
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         
         residual = hidden_states
@@ -234,9 +222,7 @@ class PLM4TS_Base(Qwen2Model):
         )
         self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         
-        # Qwen2Model 中自带了 ValueEmbedding (名为 self.embed_tokens)，我们这里用不到，
-        # 我们的 ValueEmbedding 是单独定义的。
-        self.embed_tokens = None
+        self.embed_tokens = None # 禁用原始的 token embedding
         self.gradient_checkpointing = False
 
     def forward(
@@ -261,7 +247,6 @@ class PLM4TS_Base(Qwen2Model):
         use_cache = use_cache if use_cache is not None else self.config.use_cache
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        # 由于我们使用 inputs_embeds，所以 input_ids 应该为 None
         if input_ids is not None:
             raise ValueError("PLM4TS_Base expects `inputs_embeds` to be passed, not `input_ids`.")
 
@@ -270,10 +255,6 @@ class PLM4TS_Base(Qwen2Model):
         
         hidden_states = inputs_embeds
         
-        # 如果提供了 timestamps，则使用它，否则使用 position_ids
-        # 这里不需要对 position_ids 或 timestamps 进行太多处理，直接传递给 layer
-        
-        # Decoder Layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
@@ -325,14 +306,13 @@ class PLM4TS_Base(Qwen2Model):
 # ==================================================================================
 
 def inject_CTRoPE_to_model(model: PreTrainedModel):
-    """递归地替换模型中的 Qwen2Attention 为 CTRoPEQwen2Attention"""
+    """递归地替换模型中的 Qwen2Attention 为 CTRoPEQwen2Attention 并安全地复制权重"""
     
     # 遍历所有子模块
     for name, module in model.named_children():
         
         # 如果找到 Qwen2Attention，则替换它
         if isinstance(module, Qwen2Attention):
-            # 确保 config 存在
             config = module.config
             layer_idx = module.layer_idx
             
@@ -345,11 +325,15 @@ def inject_CTRoPE_to_model(model: PreTrainedModel):
             new_attn.v_proj.weight.data.copy_(module.v_proj.weight.data)
             new_attn.o_proj.weight.data.copy_(module.o_proj.weight.data)
             
-            # 如果存在偏差 (bias)，也复制
+            # [FIX 7: NoneType bias] 修复了 bias 复制错误
+            # 必须为每个 proj 单独检查 bias 是否存在
             if module.q_proj.bias is not None:
                 new_attn.q_proj.bias.data.copy_(module.q_proj.bias.data)
+            if module.k_proj.bias is not None:
                 new_attn.k_proj.bias.data.copy_(module.k_proj.bias.data)
+            if module.v_proj.bias is not None:
                 new_attn.v_proj.bias.data.copy_(module.v_proj.bias.data)
+            if module.o_proj.bias is not None:
                 new_attn.o_proj.bias.data.copy_(module.o_proj.bias.data)
             
             # 替换模块
@@ -365,10 +349,6 @@ def inject_CTRoPE_to_model(model: PreTrainedModel):
 def configure_lora(args, model: PLM4TS_Base):
     """为模型配置和应用 LoRA"""
     
-    # 我们只对 Qwen2Attention 里面的 Q/K/V/O 投影矩阵应用 LoRA
-    # 注意：我们的 Attention 类是 CTRoPEQwen2Attention
-    
-    # 目标模块名称
     target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
     
     lora_config = LoraConfig(
@@ -396,8 +376,9 @@ def configure_lora(args, model: PLM4TS_Base):
 # ==================================================================================
 
 class istsplm_forecast(nn.Module):
+    # [FIX 3] 匹配 regression.py 中的类名
     def __init__(self, args):
-        super(istsplm_forecast, self).__init__() # [FIX 3] 匹配类名
+        super(istsplm_forecast, self).__init__() 
 
         self.args = args
         self.device = args.device
@@ -407,33 +388,32 @@ class istsplm_forecast(nn.Module):
         
         # [FIX 4 - ArgError] 修复参数不匹配
         self.plm_name = args.plm_path 
-        self.num_types = args.num_types # D 维度
+        self.num_types = args.num_types # D 维度 (变量数)
         self.n_plm_layers = 2 # 明确指定两个PLM：一个用于时间，一个用于变量
 
         # 1. 配置
         self.config = AutoConfig.from_pretrained(self.plm_name, trust_remote_code=True)
-        self.config.use_cache = True # 启用缓存，以便在预测时使用
-        self.config.num_hidden_layers = 2 # 覆盖配置中的层数，避免加载过多不必要的层 (如果有必要)
+        self.config.use_cache = True 
+        # 在这里不覆盖 num_hidden_layers，因为我们只加载两个模型实例，但它们会继承原始配置
         
         # 2. Embedding 层
-        # Value Embedding (将 D 维度投影到 d_model)
-        self.value_embedding = ValueEmbedding_Qwen(self.num_types, self.d_model)
-        # Variable Embedding (为 D 个变量创建位置编码，形状为 (D, d_model))
+        # Value Embedding (将 1 维值投影到 d_model)
+        self.value_embedding = ValueEmbedding_Qwen(1, self.d_model)
+        # Variable Embedding (为 D 个变量创建 embedding)
         self.var_embedding = nn.Embedding(self.num_types, self.d_model)
 
         # 3. PLM 模块 (两个独立的 PLM 实例)
         gpts = []
         for i in range(self.n_plm_layers):
-            # 3a. 使用 .from_pretrained() 加载预训练模型
+            # 3a. 使用 .from_pretrained() 加载预训练模型 (FIX 6: load_weights)
             model = PLM4TS_Base.from_pretrained(
                 self.plm_name,
                 config=self.config,
-                ignore_mismatched_sizes=True, # 忽略 d_model 等不匹配的尺寸
+                ignore_mismatched_sizes=True,
                 trust_remote_code=True
             )
             
             # 3b. 注入 CT-RoPE
-            # 这会用 CTRoPEQwen2Attention 替换 Qwen2Attention
             model = inject_CTRoPE_to_model(model)
             
             # 3c. 应用 LoRA
@@ -451,17 +431,20 @@ class istsplm_forecast(nn.Module):
         self.forecasting_head = nn.Sequential(
             nn.Linear(self.d_model, self.d_model // 2),
             nn.LeakyReLU(),
-            nn.Linear(self.d_model // 2, self.num_types)
+            nn.Linear(self.d_model // 2, self.num_types) # 输出维度 D
         )
         
-        # 6. Prompt/Patch Embedding (用于时间 PLM 的前缀)
+        # 6. Prompt/Patch Embedding 
         self.patch_len = args.patch_len
         self.prompt_len = args.prompt_len
+        # (1, L_prompt, d_model)
         self.prompt_embed = nn.Parameter(torch.randn(1, self.prompt_len, self.d_model))
         
 
     def forecasting(self, batch_dict, n_vars_to_predict=None):
-        # [FIX 5: KeyError] 使用 batch_dict 中的原始键
+        # [FIX 5: KeyError & FIX 7: evaluation.py 接口]
+        # 现在接收 batch_dict 和 n_vars_to_predict
+        
         observed_data = batch_dict["observed_data"].to(self.device) # (B, L_obs, D)
         observed_mask = batch_dict["observed_mask"].to(self.device) # (B, L_obs, D)
         observed_tp = batch_dict["observed_tp"].to(self.device)     # (B, L_obs)
@@ -471,24 +454,21 @@ class istsplm_forecast(nn.Module):
         L_pred = tp_to_predict.shape[1]
 
         # ----------------------------------------------------
-        # 步骤 1: 准备输入
+        # 步骤 1: 准备输入 (时间 PLM)
         # ----------------------------------------------------
         
         # 1a. Value Embedding
-        # 将 (B, L_obs, D) 转换为 (B*D, L_obs, 1) 以进行时间 PLM
-        x = observed_data.permute(0, 2, 1).reshape(B * D, L_obs, 1) # (B*D, L_obs, 1)
+        # 将 (B, L_obs, D) 转换为 (B*D, L_obs, 1) 以进行时间 PLM (每个变量独立)
+        x_flat = observed_data.permute(0, 2, 1).reshape(B * D, L_obs, 1) 
         # 投影到隐藏层维度 (B*D, L_obs, d_model)
-        value_embed = self.value_embedding(x) 
+        value_embed = self.value_embedding(x_flat) 
 
         # 1b. Times Embedding (CT-RoPE)
         # 复制 observed_tp，使其与 (B*D) 批次大小匹配
-        tt = observed_tp.unsqueeze(1).expand(B, D, L_obs).reshape(B * D, L_obs) # (B*D, L_obs)
+        tt = observed_tp.unsqueeze(1).expand(B, D, L_obs).reshape(B * D, L_obs)
         
-        # 1c. 添加 Prompt/Prefix (如 MIRA 所述)
-        # Prompt shape: (1, L_prompt, d_model) -> (B*D, L_prompt, d_model)
+        # 1c. 添加 Prompt/Prefix
         prompt_embed = self.prompt_embed.expand(B * D, -1, -1)
-        
-        # 拼接 Prompt 和 Value Embed
         inputs_embeds = torch.cat([prompt_embed, value_embed], dim=1) # (B*D, L_prompt + L_obs, d_model)
         
         # 拼接时间戳：Prompt 的时间戳为 0
@@ -496,11 +476,16 @@ class istsplm_forecast(nn.Module):
         tt_with_prompt = torch.cat([tt_prompt, tt], dim=1) # (B*D, L_prompt + L_obs)
         
         # 1d. Attention Mask (忽略 Prompt)
-        # 掩码形状：(B*D, L_prompt + L_obs)
         time_attn_mask_data_flat = observed_mask[:, :, 0].flatten().unsqueeze(1) # (B*D, L_obs)
         time_attn_mask_prompt = torch.ones(B * D, self.prompt_len, device=self.device) # Prompt 完全可见
         time_attn_mask = torch.cat([time_attn_mask_prompt, time_attn_mask_data_flat], dim=1)
+        # 转换为 Qwen 所需的格式 (B, 1, 1, L_total)
+        # Qwen attention mask 处理复杂，这里我们使用 (B, 1, L_total, L_total) 的对角下三角掩码
+        # 为了简单，我们只使用 padding mask (B, 1, 1, L_total)
+        # 注意：Qwen内部会自动生成 causal mask
+        time_attn_mask = (1.0 - time_attn_mask) * torch.finfo(torch.float32).min # (B*D, L_total) -> 转换为 additive mask
         time_attn_mask = time_attn_mask.unsqueeze(1).unsqueeze(1) # (B*D, 1, 1, L_total)
+        time_attn_mask = time_attn_mask.to(self.device)
 
         # ----------------------------------------------------
         # 步骤 2: PLM 1 (时间感知)
@@ -509,7 +494,7 @@ class istsplm_forecast(nn.Module):
         outputs = self.gpts[0](
             inputs_embeds=inputs_embeds,
             attention_mask=time_attn_mask,
-            timestamps=tt_with_prompt # <-- 传递连续时间
+            timestamps=tt_with_prompt 
         ).last_hidden_state
 
         # ----------------------------------------------------
@@ -517,7 +502,7 @@ class istsplm_forecast(nn.Module):
         # ----------------------------------------------------
         
         # 重新引入 observed_mask
-        observed_mask_pooled = observed_mask.permute(0, 2, 1).reshape(B * D, L_obs, 1)
+        observed_mask_pooled = observed_mask.permute(0, 2, 1).reshape(B * D, L_obs, 1) # (B*D, L_obs, 1)
         
         # outputs shape: (B*D, L_prompt + L_obs, d_model)
         # 排除 Prompt 后的输出
@@ -535,36 +520,38 @@ class istsplm_forecast(nn.Module):
         # ----------------------------------------------------
 
         # 4a. Variable Embedding 
-        # (B, D, d_model) -> (B, D, d_model)
         var_embedding = self.var_embedding.weight.unsqueeze(0).expand(B, D, -1)
-        
-        # 将时间 PLM 的输出和 Variable Embedding 相加
         outputs = outputs + var_embedding
         
         # 4b. Position IDs (离散位置索引)
         var_position_ids = torch.arange(D, device=self.device).unsqueeze(0).expand(B, D)
-        var_attn_mask = torch.ones(B, 1, D, D, device=self.device, dtype=torch.float32) # 全连接掩码 (B, 1, D, D)
+        
+        # 4c. Variable Attention Mask (全连接)
+        # (B, 1, D, D)
+        var_attn_mask = torch.zeros(B, D, D, device=self.device, dtype=torch.float32)
+        var_attn_mask = var_attn_mask.masked_fill(var_attn_mask == 0, 0.0) # 确保无负无穷
+        var_attn_mask = var_attn_mask.unsqueeze(1) # (B, 1, D, D)
 
-        # 4c. PLM 2 执行
+        # 4d. PLM 2 执行 (不传递 timestamps)
         outputs = self.gpts[1](
             inputs_embeds=outputs,
             attention_mask=var_attn_mask,
-            position_ids=var_position_ids # <-- 传递离散索引
+            position_ids=var_position_ids 
         ).last_hidden_state # (B, D, d_model)
         
         # ----------------------------------------------------
         # 步骤 5: 预测
         # ----------------------------------------------------
         
-        # 我们需要从 (B, D, d_model) -> (B, D, 1)
-        forecast_vars = self.forecasting_head(outputs) # (B, D, D_output_dim=D)
+        # 预测头返回 D 维度的变量值 (B, D, D)
+        forecast_vars = self.forecasting_head(outputs) 
 
-        # 由于预测是针对 L_pred 时间步的，我们这里需要一个简单的策略来扩展或预测 L_pred 个值。
-        # 简单扩展（ISTS-PLM 原有策略）：将最终的 (B, D) 预测结果复制 L_pred 次
+        # 假设预测值是 D 维度中的第一个 (或平均值)
+        # 这里使用第一个维度作为回归预测值
+        regression_value = forecast_vars[:, :, 0] # (B, D)
         
-        # 预测头返回的是 D 维度的变量值 (B, D, D)
-        # 我们假设我们只需要预测第一个维度，即回归值
-        forecast = forecast_vars[:, :, 0].unsqueeze(1).expand(-1, L_pred, -1) # (B, L_pred, D)
+        # 扩展到 L_pred 时间步 (ISTS-PLM 原有策略)
+        forecast = regression_value.unsqueeze(1).expand(-1, L_pred, -1) # (B, L_pred, D)
 
         # 如果需要预测的变量维度少于 D
         if n_vars_to_predict is not None:

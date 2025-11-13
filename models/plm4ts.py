@@ -111,11 +111,15 @@ class istsplm_forecast(nn.Module):
 
     # ---------------- Freeze / LoRA ----------------
     def _apply_lora_qwen(self, args, model):
+        # IMPORTANT: use FEATURE_EXTRACTION for base (non-generation) model
         target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
         lora_cfg = LoraConfig(
-            r=args.lora_r, lora_alpha=args.lora_alpha,
-            target_modules=target_modules, lora_dropout=args.lora_dropout,
-            bias="none", task_type=TaskType.CAUSAL_LM
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            target_modules=target_modules,
+            lora_dropout=args.lora_dropout,
+            bias="none",
+            task_type=TaskType.FEATURE_EXTRACTION  # changed from CAUSAL_LM
         )
         model = get_peft_model(model, lora_cfg)
         for n, p in model.named_parameters():
@@ -124,12 +128,15 @@ class istsplm_forecast(nn.Module):
         return model
 
     def _apply_lora_bert(self, args, model):
-        # Apply LoRA to BERT attention and FFN dense layers
+        # Apply LoRA to BERT attention and FFN dense layers (feature extraction task)
         target_modules = ["query", "key", "value", "dense"]
         lora_cfg = LoraConfig(
-            r=args.lora_r, lora_alpha=args.lora_alpha,
-            target_modules=target_modules, lora_dropout=args.lora_dropout,
-            bias="none", task_type=TaskType.CAUSAL_LM
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            target_modules=target_modules,
+            lora_dropout=args.lora_dropout,
+            bias="none",
+            task_type=TaskType.FEATURE_EXTRACTION  # changed from CAUSAL_LM
         )
         model = get_peft_model(model, lora_cfg)
         for n, p in model.named_parameters():

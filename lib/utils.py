@@ -322,12 +322,20 @@ def normalize_masked_data(data, mask, att_min, att_max):
 	scale = att_max - att_min
 	scale = scale + (scale == 0) * 1e-8
 	# we don't want to divide by zero
-	if (scale != 0.).all(): 
-		data_norm = (data - att_min) / scale
+	if (scale != 0.).all(): 
+                
+		# (!!!) 修正点：
+		# 原始代码: data_norm = (data - att_min) / scale
+		# 这会报错，因为 data 在 GPU (cuda:0) 而 att_min 和 scale 在 CPU
+		#
+		# 修正后:
+		# 我们使用 .to(data.device) 将 att_min 和 scale 动态地移动到 data 所在的设备 (cuda:0)
+		data_norm = (data - att_min.to(data.device)) / scale.to(data.device)
+	
 	else:
 		raise Exception("Zero!")
 
-	# set masked out elements back to zero 
+	# set masked out elements back to zero 
 	data_norm[mask == 0] = 0
 
 	if torch.isnan(data_norm).any():

@@ -1,8 +1,3 @@
-###########################
-# Latent ODEs for Irregularly-Sampled Time Series
-# Author: Yulia Rubanova
-###########################
-
 import gc
 import numpy as np
 import sklearn as sk
@@ -25,15 +20,15 @@ def gaussian_log_likelihood(mu_2d, data_2d, obsrv_std, indices = None):
 
 	if n_data_points > 0:
 		gaussian = Independent(Normal(loc = mu_2d, scale = obsrv_std.repeat(n_data_points)), 1)
-		log_prob = gaussian.log_prob(data_2d) 
-		log_prob = log_prob / n_data_points 
+		log_prob = gaussian.log_prob(data_2d)
+		log_prob = log_prob / n_data_points
 	else:
 		log_prob = torch.zeros([1]).to(get_device(data_2d)).squeeze()
 	return log_prob
 
 
 def poisson_log_likelihood(masked_log_lambdas, masked_data, indices, int_lambdas):
-	# masked_log_lambdas and masked_data 
+	# masked_log_lambdas and masked_data
 	n_data_points = masked_data.size()[-1]
 
 	if n_data_points > 0:
@@ -230,7 +225,7 @@ def compute_mse(mu, data, mask = None):
 	else:
 		# Compute the likelihood per patient so that we don't priorize patients with more measurements
 		# (n_traj_samples, n_traj, n_timepoints, n_dims) -> (n_traj (bs), 1)
-		res = compute_masked_likelihood(mu, data, mask, mse) 
+		res = compute_masked_likelihood(mu, data, mask, mse)
 		# print(mu.shape, res.shape)
 	return res
 
@@ -320,7 +315,7 @@ def compute_error(truth, pred_y, mask, func, reduce, norm_dict=None):
 	
 	elif(reduce == "sum"):
 		# (n_dim, ) , (n_dim, ) 
-		return error_var_sum, mask_count  
+		return error_var_sum, mask_count 
 
 	else:
 		raise Exception("Reduce argument not specified!")
@@ -331,9 +326,8 @@ def compute_all_losses(model, batch_dict, dataset=None):
 	# Make predictions for all the points
 	# shape of pred --- [n_traj_samples=1, n_batch, n_tp, n_dim]
 
-	pred_y = model.forecasting(batch_dict["tp_to_predict"], 
-		batch_dict["observed_data"], batch_dict["observed_tp"], 
-		batch_dict["observed_mask"]) 
+    # [FIX] 仅传递 batch_dict，让 model.forecasting 使用所需的参数
+	pred_y = model.forecasting(batch_dict, n_vars_to_predict=None)
 	# print("pred:", pred_y.shape, batch_dict["mask_predicted_data"].shape)
 
 	# Compute avg error of each variable first, then compute avg error of all variables
@@ -374,9 +368,8 @@ def evaluation(model, dataloader, n_batches):
 		# bs = batch_dict["observed_data"].shape[0]
 		# print(batch_dict["observed_data"].shape)
 
-		pred_y = model.forecasting(batch_dict["tp_to_predict"], 
-			batch_dict["observed_data"], batch_dict["observed_tp"], 
-			batch_dict["observed_mask"]) 
+        # [FIX] 仅传递 batch_dict，让 model.forecasting 使用所需的参数
+		pred_y = model.forecasting(batch_dict, n_vars_to_predict=None)
 		
 		# print('consistency test:', batch_dict["data_to_predict"][batch_dict["mask_predicted_data"].bool()].sum(),\
 		# 	batch_dict["mask_predicted_data"].sum(), batch_dict["tp_to_predict"].sum()) # consistency test

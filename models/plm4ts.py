@@ -464,22 +464,42 @@ class istsplm_forecast(nn.Module):
         value_embed = self.value_embedding(x_flat) 
 
         # 1b. Times Embedding (CT-RoPE)
-        # 将 observed_tp 统一成二维 (B, L_obs)，兼容 (B, L_obs) 与 (B, 1, L_obs)
-        observed_tp = observed_tp_raw.reshape(B, -1)  # (B, L_obs)
-        # 复制 observed_tp，使其与 (B*D) 批次大小匹配
-        tt = observed_tp.unsqueeze(1).expand(B, D, L_obs).reshape(B * D, L_obs)
+        # 将 observed_tp 统一成二维 (B, ?)，兼容 (B, L_obs) 与 (B, 1, L_obs)
+        observed_tp = observed_tp_raw.reshape(B, -1)  # (B, L_time_raw)
+        # 对齐时间步长度到 value_embed 的序列长度
+        L_val = value_embed.size(1)   # 由值序列决定的长度 (应等于 L_obs)
+        L_time = observed_tp.size(1)  # 由时间戳决定的长度
+        if L_time != L_val:
+            if L_time >= L_val:
+                observed_tp_aligned = observed_tp[:, -L_val:]
+            else:
+                pad = torch.zeros(B, L_val - L_time, device=self.device, dtype=observed_tp.dtype)
+                observed_tp_aligned = torch.cat([observed_tp, pad], dim=1)
+        else:
+            observed_tp_aligned = observed_tp
+
+        # 复制 observed_tp_aligned，使其与 (B*D) 批次大小匹配
+        tt = observed_tp_aligned.unsqueeze(1).expand(B, D, L_val).reshape(B * D, L_val)
         
         # 1c. 添加 Prompt/Prefix
         prompt_embed = self.prompt_embed.expand(B * D, -1, -1)
-        inputs_embeds = torch.cat([prompt_embed, value_embed], dim=1) # (B*D, L_prompt + L_obs, d_model)
+        inputs_embeds = torch.cat([prompt_embed, value_embed], dim=1) # (B*D, L_prompt + L_val, d_model)
         
         # 拼接时间戳：Prompt 的时间戳为 0
         tt_prompt = torch.zeros(B * D, self.prompt_len, device=self.device)
-        tt_with_prompt = torch.cat([tt_prompt, tt], dim=1) # (B*D, L_prompt + L_obs)
+        tt_with_prompt = torch.cat([tt_prompt, tt], dim=1) # (B*D, L_prompt + L_val)
         
         # 1d. Attention Mask (忽略 Prompt)
-        # 修复：使用每个变量自己的 mask，形状对齐到 (B*D, L_obs)
+        # 使用每个变量自己的 mask，形状对齐到 (B*D, L_val)
         time_attn_mask_data_flat = observed_mask.permute(0, 2, 1).reshape(B * D, L_obs) # (B*D, L_obs)
+        # 若 L_obs != L_val，则截断或右侧补 0 对齐
+        if L_obs != L_val:
+            if L_obs >= L_val:
+                time_attn_mask_data_flat = time_attn_mask_data_flat[:, -L_val:]
+            else:
+                pad_m = torch.zeros(B * D, L_val - L_obs, device=self.device, dtype=time_attn_mask_data_flat.dtype)
+                time_attn_mask_data_flat = torch.cat([time_attn_mask_data_flat, pad_m], dim=1)
+
         time_attn_mask_prompt = torch.ones(B * D, self.prompt_len, device=self.device) # Prompt 完全可见
         time_attn_mask = torch.cat([time_attn_mask_prompt, time_attn_mask_data_flat], dim=1) # (B*D, L_total)
         # 转换为 Qwen 所需的 additive mask (B*D, 1, 1, L_total); Qwen 内部有因果掩码
@@ -503,10 +523,17 @@ class istsplm_forecast(nn.Module):
         
         # 重新引入 observed_mask
         observed_mask_pooled = observed_mask.permute(0, 2, 1).reshape(B * D, L_obs, 1) # (B*D, L_obs, 1)
+        # 若 L_obs != L_val，同样对齐 mask 到 L_val，便于与 outputs_data 对齐
+        if L_obs != L_val:
+            if L_obs >= L_val:
+                observed_mask_pooled = observed_mask_pooled[:, -L_val:, :]
+            else:
+                pad_m3d = torch.zeros(B * D, L_val - L_obs, 1, device=self.device, dtype=observed_mask_pooled.dtype)
+                observed_mask_pooled = torch.cat([observed_mask_pooled, pad_m3d], dim=1)
         
-        # outputs shape: (B*D, L_prompt + L_obs, d_model)
+        # outputs shape: (B*D, L_prompt + L_val, d_model)
         # 排除 Prompt 后的输出
-        outputs_data = outputs[:, self.prompt_len:] # (B*D, L_obs, d_model)
+        outputs_data = outputs[:, self.prompt_len:] # (B*D, L_val, d_model)
         
         # 应用掩码和求平均（跳过 Prompt 部分）
         n_nonmask = (observed_mask_pooled.sum(dim=1) + 1e-8) # (B*D, 1)

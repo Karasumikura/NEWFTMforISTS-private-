@@ -12,7 +12,6 @@ class ValueEmbeddingQwen(nn.Module):
         self.proj = nn.Linear(c_in, d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 全部保持 float32
         return self.proj(x.float())
 
 
@@ -35,14 +34,14 @@ class istsplm_forecast(nn.Module):
 
         # Load Qwen2.5 in float32
         self.config = AutoConfig.from_pretrained(self.plm_name, trust_remote_code=True)
-        self.config.use_cache = True
+        self.config.use_cache = False  # 预测任务不需要缓存
 
         gpts = []
         for _ in range(self.n_plm_layers):
             base = AutoModelForCausalLM.from_pretrained(
                 self.plm_name,
                 trust_remote_code=True,
-                torch_dtype=torch.float32  # 强制 float32
+                torch_dtype=torch.float32
             )
             core = getattr(base, "model", base)
             core = self._inject_ctr_rope(core, verbose=False)
@@ -175,9 +174,16 @@ class istsplm_forecast(nn.Module):
                 attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, num_heads * head_dim)
                 attn_output = o_proj(attn_output)
 
-                if not output_attentions:
-                    attn_weights = None
-                return attn_output, attn_weights, past
+                if output_attentions:
+                    attn_ret = attn_weights
+                else:
+                    attn_ret = None
+
+                # 根据 use_cache 决定返回长度
+                if use_cache:
+                    return attn_output, attn_ret, past
+                else:
+                    return attn_output, attn_ret
 
             return new_forward
 
@@ -187,7 +193,6 @@ class istsplm_forecast(nn.Module):
         return core_model
 
     def forecasting(self, batch_dict, n_vars_to_predict=None):
-        # 输入全部转 float32
         observed_data = batch_dict["observed_data"].to(self.device).float()
         observed_mask = batch_dict["observed_mask"].to(self.device).float()
         observed_tp_raw = batch_dict["observed_tp"].to(self.device).float()
@@ -213,7 +218,7 @@ class istsplm_forecast(nn.Module):
         tt = tp_aligned.unsqueeze(1).expand(B, D, L_val).reshape(B * D, L_val)
 
         prompt = self.prompt_embed.expand(B * D, -1, -1).float()
-        inputs_embeds = torch.cat([prompt, value_embed], dim=1)  # (B*D, prompt+L_val, d_model)
+        inputs_embeds = torch.cat([prompt, value_embed], dim=1)
 
         tt_prompt = torch.zeros(B * D, self.prompt_len, device=self.device)
         tt_with_prompt = torch.cat([tt_prompt, tt], dim=1)
@@ -231,11 +236,14 @@ class istsplm_forecast(nn.Module):
         additive_mask = (1.0 - time_mask) * torch.finfo(torch.float32).min
         additive_mask = additive_mask.unsqueeze(1).unsqueeze(1)
 
+        # 调用时间 PLM，强制 use_cache=False
         out_time = self.gpts[0](
             inputs_embeds=inputs_embeds,
             attention_mask=additive_mask,
-            timestamps=tt_with_prompt
-        ).last_hidden_state  # (B*D, total_len, d_model)
+            timestamps=tt_with_prompt,
+            use_cache=False,
+            output_attentions=False
+        ).last_hidden_state
 
         mask_pool = observed_mask.permute(0, 2, 1).reshape(B * D, L_obs, 1)
         if L_obs != L_val:
@@ -258,8 +266,10 @@ class istsplm_forecast(nn.Module):
         out_var = self.gpts[1](
             inputs_embeds=var_inputs,
             attention_mask=var_attn_mask,
-            position_ids=position_ids
-        ).last_hidden_state  # (B,D,d_model)
+            position_ids=position_ids,
+            use_cache=False,
+            output_attentions=False
+        ).last_hidden_state
 
         forecast_vars = self.forecasting_head(out_var)
         regression_value = forecast_vars[:, :, 0]

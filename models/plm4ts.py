@@ -194,7 +194,7 @@ class CTRoPEQwen2Attention(Qwen2Attention):
             )
 
         if attention_mask is not None:
-            # [FIX START]
+            # [FIX 2 - RuntimeError]
             # 修复了 RuntimeError：为 use_cache=True (解码/预测) 添加掩码切片逻辑
             # cache_position 在 use_cache=True 的生成期间被传递
             if cache_position is not None:
@@ -213,7 +213,7 @@ class CTRoPEQwen2Attention(Qwen2Attention):
                 # 这是训练模式或提示处理 (cache_position 为 None)
                 # 掩码和 q_len 应该匹配
                 attn_weights = attn_weights + attention_mask
-            # [FIX END]
+            # [FIX 2 END]
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
@@ -277,10 +277,11 @@ class Qwen2DecoderLayerWithCTRoPE(Qwen2DecoderLayer):
             use_cache=use_cache,
             cache_position=cache_position,
         )
-        # [FIX START]
+        
+        # [FIX 1 - SyntaxError]
         # 修复了 SyntaxError：删除了下面这行无效的代码
         # past_key_value: Optional] = None, 
-        # [FIX END]
+        # [FIX 1 END]
 
         hidden_states = residual + attn_outputs
 
@@ -372,9 +373,11 @@ class PLM4TS_Base(Qwen2Model):
         if self.gradient_checkpointing and self.training and use_cache:
             use_cache = False
 
+        # [MODIFIED] 获取 cache_position (为掩码切片做准备)
         cache_position = self._get_cache_position(attention_mask, inputs_embeds.shape[1])
         
         if attention_mask is not None:
+             # [MODIFIED] 准备注意力掩码 (Qwen2的标准流程)
              attention_mask = self._prepare_causal_attention_mask(
                 attention_mask,
                 inputs_embeds.shape[1],
@@ -400,7 +403,7 @@ class PLM4TS_Base(Qwen2Model):
                 # ... (省略 checkpointing 逻辑)
                 pass
             
-            # [MODIFIED] 将 'timestamps' 传递给 decoder_layer
+            # [MODIFIED] 将 'timestamps' 和 'cache_position' 传递给 decoder_layer
             layer_outputs = decoder_layer(
                 hidden_states,
                 timestamps=timestamps, # <-- 在这里传递
@@ -409,7 +412,7 @@ class PLM4TS_Base(Qwen2Model):
                 past_key_value=past_key_value,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
-                cache_position=cache_position,
+                cache_position=cache_position, # <-- 在这里传递
             )
 
             hidden_states = layer_outputs[0]
@@ -476,19 +479,23 @@ def inject_CTRoPE_to_model(model: Qwen2Model):
 # 第 6 部分：模型集成 (主 ISTS-PLM 模型)
 # ==================================================================================
 
-class ISTS_PLM(nn.Module):
+# [FIX 3 - NameError] 重命名类 (原为 ISTS_PLM)
+class istsplm_forecast(nn.Module):
     def __init__(self, args):
-        super(ISTS_PLM, self).__init__()
+        super(istsplm_forecast, self).__init__() # [FIX 3] 匹配类名
         self.args = args
         self.device = args.device
 
         # 1. 加载 PLM (Qwen2)
-        self.plm_name = args.plm
+        # [FIX 4 - ArgError] 使用 plm_path (原为 args.plm)
+        self.plm_name = args.plm_path 
         self.config = AutoConfig.from_pretrained(self.plm_name, trust_remote_code=True)
         
         # [MODIFIED] 设置我们的 PLM4TS_Base 作为基础
         self.config.use_cache = True 
-        gpts = [PLM4TS_Base(self.config) for _ in range(args.n_plm_layers)]
+        # [FIX 4 - ArgError] 硬编码 n_plm_layers=2 (一个用于时间，一个用于变量)
+        # (原为 args.n_plm_layers, 但 regression.py 未定义)
+        gpts = [PLM4TS_Base(self.config) for _ in range(2)]
         
         # [MODIFIED] 注入 CT-RoPE
         # 这会用 CTRoPEQwen2Attention 替换 Qwen2Attention
@@ -521,7 +528,8 @@ class ISTS_PLM(nn.Module):
         
         # Embedding 层
         self.value_embedding = ValueEmbedding_Qwen(self.patch_len, self.d_model)
-        self.variable_embedding = VariableEmbedding_Qwen(args.n_vars, self.d_model)
+        # [FIX 4 - ArgError] 使用 num_types (原为 args.n_vars)
+        self.variable_embedding = VariableEmbedding_Qwen(args.num_types, self.d_model)
         
         # 投影层
         self.ln_proj = nn.LayerNorm(self.d_model)
@@ -539,26 +547,6 @@ class ISTS_PLM(nn.Module):
         L_total = x.shape[1] # L + prompt_len
 
         # 2. PLM 1 (时间感知)
-        
-        # 值 Embedding (B, L_total, D) -> (B, L_total, D, d_model)
-        # (我们假设 x 已经被 patch 并且 c_in=patch_len)
-        # TODO: 确认 x 的形状。假设 x 是 (B, L_total_patched, D, d_model)
-        # 基于 ISTS-PLM，x 应该是 (B, L, D, P) -> (B, D, L, P)
-        # 假设 x 已经是 (B, D, L_patched, d_model)
-        
-        # 按照 ISTS-PLM 论文 (图 2)
-        # (B, L_total, D)
-        x = x.permute(0, 2, 1) # (B, D, L_total)
-        
-        # (B, D, L_total) -> (B*D, L_total, 1)
-        # (假设 value_embedding 期望 c_in=1, d_model=d_model)
-        # TODO: 这里的 value_embedding 不匹配。
-        # 让我们遵循原始的 ISTS-PLM 流程：
-        
-        # (B, L, D) -> (B, D, L, P)
-        # x_patch = self.patching(x)
-        # (B, D, L_p, d_model)
-        # inputs_embeds = self.value_embedding(x_patch) 
         
         # 假设 `x` 已经是 `inputs_embeds` (B, D, L_p, d_model)
         # `t` 已经是 (B, D, L_p)
@@ -604,10 +592,14 @@ class ISTS_PLM(nn.Module):
 
         # 3. Masked Pooling (掩码池化)
         observed_mask_pooled = observed_mask.permute(0, 2, 1).reshape(B*D, -1, 1)
-        observed_mask_pooled = torch.cat([torch.ones_like(observed_mask_pooled[:,:1]), observed_mask_pooled], dim=1) # 考虑 prompt
+        # 确保 prompt 部分被包含在池化中
+        observed_mask_pooled_with_prompt = torch.cat([
+            torch.ones(B*D, self.prompt_len, 1, device=self.device, dtype=observed_mask_pooled.dtype), 
+            observed_mask_pooled
+        ], dim=1)
         
-        n_nonmask = (observed_mask_pooled.sum(dim=1) + 1e-8)
-        outputs = (outputs * observed_mask_pooled).sum(dim=1) / n_nonmask
+        n_nonmask = (observed_mask_pooled_with_prompt.sum(dim=1) + 1e-8)
+        outputs = (outputs * observed_mask_pooled_with_prompt).sum(dim=1) / n_nonmask
         outputs = self.ln_proj(outputs.view(B, D, -1))
         
         # 4. PLM 2 (变量感知)
@@ -615,14 +607,17 @@ class ISTS_PLM(nn.Module):
         
         # (B, D)
         var_attn_mask = torch.ones(B, D, device=self.device, dtype=torch.long)
-        # (B, D)
+        
+        # [FIX 5 - 新的Bug修复] 
+        # 第二个 PLM (gpts[1]) 也是一个 CT-RoPE 模型，它需要 'timestamps' 而不是 'position_ids'
+        # 我们为 D 个变量创建一个简单的连续时间戳 [0, 1, ..., D-1]
         var_timestamps = torch.arange(D, device=self.device).float().unsqueeze(0).expand(B, D)
 
         outputs = self.gpts[1](
             inputs_embeds=outputs,
             attention_mask=var_attn_mask,
-            timestamps=var_timestamps # <-- 传递连续时间 (只是 0..D-1)
-            # position_ids=var_position_ids # <-- CT-RoPE 不需要这个
+            timestamps=var_timestamps # <-- [FIX 5] 传递连续时间
+            # position_ids=var_position_ids # <-- 不再使用这个
         ).last_hidden_state
 
         # 5. 最终投影
